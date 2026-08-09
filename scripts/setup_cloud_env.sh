@@ -5,8 +5,30 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 
+ensure_venv_capable() {
+  # Default Cursor images may lack ensurepip / python3-venv.
+  if python3 -c "import ensurepip" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "ensurepip missing; installing python3-venv via apt..."
+  if command -v sudo >/dev/null 2>&1; then
+    sudo apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv python3-pip unzip
+  else
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv python3-pip unzip
+  fi
+}
+
+venv_usable() {
+  [ -x .venv/bin/python ] && .venv/bin/python -c "import sys; raise SystemExit(0 if sys.prefix != sys.base_prefix else 1)" 2>/dev/null
+}
+
+ensure_venv_capable
+
 # Prefer a project venv so we don't fight system Python / PEP 668.
-if [ ! -d .venv ]; then
+if ! venv_usable; then
+  rm -rf .venv
   python3 -m venv .venv
 fi
 # shellcheck disable=SC1091
@@ -24,6 +46,13 @@ python -m pip install -r requirements-cpu.txt
 # Unpack NYC dataset if needed (zip already includes graph_A/X).
 if [ ! -f dataset/NYC/NYC_train.csv ]; then
   mkdir -p dataset
+  if ! command -v unzip >/dev/null 2>&1; then
+    if command -v sudo >/dev/null 2>&1; then
+      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq unzip
+    else
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq unzip
+    fi
+  fi
   unzip -o -q dataset/NYC.zip -d dataset
   rm -rf dataset/__MACOSX || true
 fi
