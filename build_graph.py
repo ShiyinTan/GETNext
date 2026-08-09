@@ -1,4 +1,4 @@
-""" Build the user-agnostic global trajectory flow map from the sequence data """
+"""从签到序列构建用户无关的全局轨迹流图 (Trajectory Flow Map)"""
 import os
 import pickle
 
@@ -9,6 +9,9 @@ from tqdm import tqdm
 
 
 def build_global_POI_checkin_graph(df, exclude_user=None):
+    """从全体用户签到轨迹构建有向加权 POI 转移图。
+    节点=POI，边=同一 trajectory 内相邻签到转移，边权=转移频次。
+    """
     G = nx.DiGraph()
     users = list(set(df['user_id'].to_list()))
     if exclude_user in users: users.remove(exclude_user)
@@ -16,7 +19,7 @@ def build_global_POI_checkin_graph(df, exclude_user=None):
     for user_id in loop:
         user_df = df[df['user_id'] == user_id]
 
-        # Add node (POI)
+        # ---------- 步骤1: 添加/更新 POI 节点及其属性 ----------
         for i, row in user_df.iterrows():
             node = row['POI_id']
             if node not in G.nodes():
@@ -30,19 +33,19 @@ def build_global_POI_checkin_graph(df, exclude_user=None):
             else:
                 G.nodes[node]['checkin_cnt'] += 1
 
-        # Add edges (Check-in seq)
+        # ---------- 步骤2: 按轨迹顺序添加转移边 prev_POI -> cur_POI ----------
         previous_poi_id = 0
         previous_traj_id = 0
         for i, row in user_df.iterrows():
             poi_id = row['POI_id']
             traj_id = row['trajectory_id']
-            # No edge for the begin of the seq or different traj
+            # 轨迹起点或切换到新轨迹时不连边
             if (previous_poi_id == 0) or (previous_traj_id != traj_id):
                 previous_poi_id = poi_id
                 previous_traj_id = traj_id
                 continue
 
-            # Add edges
+            # 已有边则 weight+=1，否则新建边 weight=1
             if G.has_edge(previous_poi_id, poi_id):
                 G.edges[previous_poi_id, poi_id]['weight'] += 1
             else:  # Add new edge
@@ -50,22 +53,25 @@ def build_global_POI_checkin_graph(df, exclude_user=None):
             previous_traj_id = traj_id
             previous_poi_id = poi_id
 
+    # 返回: NetworkX DiGraph，|V|=N_poi, |E|=转移边数
     return G
 
 
 def save_graph_to_csv(G, dst_dir):
-    # Save graph to an adj matrix file and a nodes file
-    # Adj matrix file: edge from row_idx to col_idx with weight; Rows and columns are ordered according to nodes file.
-    # Nodes file: node_name/poi_id, node features (category, location); Same node order with adj matrix.
+    """将图保存为邻接矩阵与节点特征表，行列顺序与节点列表一致。
+    输出:
+      graph_A.csv: A, shape (N_poi, N_poi)，A[i,j]=从节点i到j的转移频次
+      graph_X.csv: 每行一个节点，含 checkin_cnt/类别/经纬度等
+    """
 
-    # Save adj matrix
+    # ---------- 步骤3: 导出邻接矩阵 A ----------
     nodelist = G.nodes()
-    A = nx.adjacency_matrix(G, nodelist=nodelist)
+    A = nx.adjacency_matrix(G, nodelist=nodelist)  # sparse, shape (N_poi, N_poi)
     # np.save(os.path.join(dst_dir, 'adj_mtx.npy'), A.todense())
     np.savetxt(os.path.join(dst_dir, 'graph_A.csv'), A.todense(), delimiter=',')
 
-    # Save nodes list
-    nodes_data = list(G.nodes.data())  # [(node_name, {attr1, attr2}),...]
+    # ---------- 步骤4: 导出节点特征表 ----------
+    nodes_data = list(G.nodes.data())  # [(node_name, {attr1, attr2}),...]，长度 N_poi
     with open(os.path.join(dst_dir, 'graph_X.csv'), 'w') as f:
         print('node_name/poi_id,checkin_cnt,poi_catid,poi_catid_code,poi_catname,latitude,longitude', file=f)
         for each in nodes_data:
@@ -100,14 +106,18 @@ def save_graph_edgelist(G, dst_dir):
 
 
 def load_graph_adj_mtx(path):
-    """A.shape: (num_node, num_node), edge from row_index to col_index with weight"""
+    """加载邻接矩阵。
+    返回 A: shape (N_poi, N_poi)，A[i,j] 为从 i 到 j 的边权(转移频次)
+    """
     A = np.loadtxt(path, delimiter=',')
     return A
 
 
 def load_graph_node_features(path, feature1='checkin_cnt', feature2='poi_catid_code',
                              feature3='latitude', feature4='longitude'):
-    """X.shape: (num_node, 4), four features: checkin cnt, poi cat, latitude, longitude"""
+    """加载节点特征。
+    返回 X: shape (N_poi, 4) = [签到次数, 类别, 纬度, 经度]
+    """
     df = pd.read_csv(path)
     rlt_df = df[[feature1, feature2, feature3, feature4]]
     X = rlt_df.to_numpy()
@@ -139,12 +149,12 @@ def print_graph_statisics(G):
 if __name__ == '__main__':
     dst_dir = r'dataset/NYC'
 
-    # Build POI checkin trajectory graph
+    # 主流程: 读训练签到 → 建全局 POI 转移图 → 落盘
     train_df = pd.read_csv(os.path.join(dst_dir, 'NYC_train.csv'))
     print('Build global POI checkin graph -----------------------------------')
     G = build_global_POI_checkin_graph(train_df)
 
-    # Save graph to disk
+    # 保存 graph.pkl / graph_A.csv+graph_X.csv / edgelist
     save_graph_to_pickle(G, dst_dir=dst_dir)
     save_graph_to_csv(G, dst_dir=dst_dir)
     save_graph_edgelist(G, dst_dir=dst_dir)

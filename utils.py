@@ -57,6 +57,10 @@ def get_normalized_features(X):
 
 
 def calculate_laplacian_matrix(adj_mat, mat_type):
+    """由邻接矩阵构造各类拉普拉斯 / 归一化矩阵。
+    adj_mat: (N, N)
+    返回同 shape (N, N)。训练使用 hat_rw_normd_lap_mat (GCN 常用形式)。
+    """
     n_vertex = adj_mat.shape[0]
 
     # row sum
@@ -80,7 +84,7 @@ def calculate_laplacian_matrix(adj_mat, mat_type):
         wid_rw_normd_lap_mat = 2 * rw_normd_lap_mat / lambda_max_rw - id_mat
         return wid_rw_normd_lap_mat
     elif mat_type == 'hat_rw_normd_lap_mat':
-        # For GCNConv
+        # For GCNConv: D̂^{-1} Â ，其中 Â=A+I, D̂=D+I
         wid_deg_mat = deg_mat + id_mat
         wid_adj_mat = adj_mat + id_mat
         hat_rw_normd_lap_mat = np.matmul(np.linalg.matrix_power(wid_deg_mat, -1), wid_adj_mat)
@@ -90,6 +94,9 @@ def calculate_laplacian_matrix(adj_mat, mat_type):
 
 
 def maksed_mse_loss(input, target, mask_value=-1):
+    """带 mask 的 MSE：忽略 target==mask_value（padding）的位置。
+    input/target: 任意同 shape，例如 (B, T_max)
+    """
     mask = target == mask_value
     out = (input[~mask] - target[~mask]) ** 2
     loss = out.mean()
@@ -97,6 +104,9 @@ def maksed_mse_loss(input, target, mask_value=-1):
 
 
 def top_k_acc(y_true_seq, y_pred_seq, k):
+    """整段序列逐步 Top-k 命中率（较少使用）。
+    y_true_seq: (T,), y_pred_seq: (T, N_poi)
+    """
     hit = 0
     # Convert to binary relevance (nonzero is relevant).
     for y_true, y_pred in zip(y_true_seq, y_pred_seq):
@@ -131,7 +141,9 @@ def MRR_metric(y_true_seq, y_pred_seq):
 
 
 def top_k_acc_last_timestep(y_true_seq, y_pred_seq, k):
-    """ next poi metrics """
+    """next-POI 指标: 只看序列最后一步是否命中 Top-k。
+    y_true_seq: (T,), y_pred_seq: (T, N_poi) → 取 [-1] 步，返回 0/1
+    """
     y_true = y_true_seq[-1]
     y_pred = y_pred_seq[-1]
     top_k_rec = y_pred.argsort()[-k:][::-1]
@@ -143,7 +155,7 @@ def top_k_acc_last_timestep(y_true_seq, y_pred_seq, k):
 
 
 def mAP_metric_last_timestep(y_true_seq, y_pred_seq, k):
-    """ next poi metrics """
+    """next-POI 指标: 最后一步的 AP@k（正样本恒为 1 时退化为 1/rank）。"""
     # AP: area under PR curve
     # But in next POI rec, the number of positive sample is always 1. Precision is not well defined.
     # Take def of mAP from Personalized Long- and Short-term Preference Learning for Next POI Recommendation
@@ -158,7 +170,7 @@ def mAP_metric_last_timestep(y_true_seq, y_pred_seq, k):
 
 
 def MRR_metric_last_timestep(y_true_seq, y_pred_seq):
-    """ next poi metrics """
+    """next-POI 指标: 最后一步真实 POI 的 Reciprocal Rank。"""
     # Mean Reciprocal Rank: Reciprocal of the rank of the first relevant item
     y_true = y_true_seq[-1]
     y_pred = y_pred_seq[-1]
