@@ -3,9 +3,17 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+ROOT="$(pwd)"
 
-if [ ! -f dataset/NYC/NYC_train.csv ]; then
+if [ -f .venv/bin/activate ]; then
+  # shellcheck disable=SC1091
+  source .venv/bin/activate
+fi
+
+if ! python -c "import torch" >/dev/null 2>&1 || [ ! -f dataset/NYC/NYC_train.csv ]; then
   bash scripts/setup_cloud_env.sh
+  # shellcheck disable=SC1091
+  source .venv/bin/activate
 fi
 
 EPOCHS="${EPOCHS:-3}"
@@ -35,7 +43,6 @@ python train.py \
   --name "${NAME}" \
   --exist-ok
 
-# Resolve latest/matching run dir
 RUN_DIR="$(ls -d runs/train/${NAME}* 2>/dev/null | sort | tail -n 1)"
 if [ -z "${RUN_DIR}" ]; then
   echo "No run directory found under runs/train/${NAME}*"

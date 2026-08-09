@@ -6,11 +6,14 @@ This repo trains GETNext (next-POI recommendation) on the NYC check-in dataset.
 
 ### Environment
 - Cloud VM is **CPU-only**. Use `requirements-cpu.txt` and the CPU PyTorch wheel.
-- Setup is defined in `.cursor/environment.json` and runs `scripts/setup_cloud_env.sh`.
+- Setup is defined in `.cursor/environment.json` (default Cursor image + install script). No custom Dockerfile.
+- `scripts/setup_cloud_env.sh` creates `.venv`, installs CPU torch, and unpacks NYC.
+- Always `source .venv/bin/activate` before running Python if the shell is fresh.
 - NYC data ships as `dataset/NYC.zip` and already includes `graph_A.csv` / `graph_X.csv`.
 
 ### Smoke train + predict (few epochs)
 ```bash
+source .venv/bin/activate  # if needed
 bash scripts/train_cpu_smoke.sh
 ```
 
