@@ -1,8 +1,8 @@
 import logging
-import logging
 import os
 import pathlib
 import pickle
+import warnings
 import zipfile
 from pathlib import Path
 
@@ -23,28 +23,71 @@ from param_parser import parameter_parser
 from utils import increment_path, calculate_laplacian_matrix, zipdir, top_k_acc_last_timestep, \
     mAP_metric_last_timestep, MRR_metric_last_timestep, maksed_mse_loss
 
+SEP = '-' * 72
+
+
+class TqdmLoggingHandler(logging.Handler):
+    """Route log records through tqdm.write so bars stay intact."""
+
+    def emit(self, record):
+        try:
+            tqdm.write(self.format(record))
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
+
+def setup_logger(save_dir, verbose=False):
+    """File keeps full detail; console shows only key INFO lines."""
+    root = logging.getLogger()
+    for handler in root.handlers[:]:
+        root.removeHandler(handler)
+    root.setLevel(logging.DEBUG)
+
+    file_handler = logging.FileHandler(os.path.join(save_dir, 'log_training.txt'), mode='w')
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(
+        '%(asctime)s %(levelname)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+    root.addHandler(file_handler)
+
+    console = TqdmLoggingHandler()
+    console.setLevel(logging.DEBUG if verbose else logging.INFO)
+    console.setFormatter(logging.Formatter('%(message)s'))
+    root.addHandler(console)
+    logging.getLogger('matplotlib.font_manager').disabled = True
+
+
+def format_epoch_summary(epoch, total_epochs, lr, train_m, val_m, saved_best=False, best_score=None):
+    """Compact, aligned epoch metrics block for the console."""
+    lines = [
+        SEP,
+        f' Epoch {epoch + 1:>4d}/{total_epochs}  |  lr={lr:.2e}',
+        SEP,
+        (f' Train  loss {train_m["loss"]:>8.4f}  '
+         f'poi {train_m["poi"]:>7.4f}  time {train_m["time"]:>7.4f}  cat {train_m["cat"]:>7.4f}'),
+        (f'        Acc@1 {train_m["top1"]:.4f}  Acc@5 {train_m["top5"]:.4f}  '
+         f'Acc@10 {train_m["top10"]:.4f}  Acc@20 {train_m["top20"]:.4f}'),
+        f'        mAP@20 {train_m["map20"]:.4f}  MRR {train_m["mrr"]:.4f}',
+        (f' Val    loss {val_m["loss"]:>8.4f}  '
+         f'poi {val_m["poi"]:>7.4f}  time {val_m["time"]:>7.4f}  cat {val_m["cat"]:>7.4f}'),
+        (f'        Acc@1 {val_m["top1"]:.4f}  Acc@5 {val_m["top5"]:.4f}  '
+         f'Acc@10 {val_m["top10"]:.4f}  Acc@20 {val_m["top20"]:.4f}'),
+        f'        mAP@20 {val_m["map20"]:.4f}  MRR {val_m["mrr"]:.4f}',
+    ]
+    if saved_best:
+        lines.append(f' * Saved best checkpoint  (score={best_score:.4f})')
+    lines.append(SEP)
+    return '\n'.join(lines)
+
 
 def train(args):
     args.save_dir = increment_path(Path(args.project) / args.name, exist_ok=args.exist_ok, sep='-')
     if not os.path.exists(args.save_dir): os.makedirs(args.save_dir)
 
-    # Setup logger
-    for handler in logging.root.handlers[:]:
-        logging.root.removeHandler(handler)
-    logging.basicConfig(level=logging.DEBUG,
-                        format='%(asctime)s %(message)s',
-                        datefmt='%Y-%m-%d %H:%M:%S',
-                        filename=os.path.join(args.save_dir, f"log_training.txt"),
-                        filemode='w')
-    console = logging.StreamHandler()
-    console.setLevel(logging.INFO)
-    formatter = logging.Formatter('%(asctime)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-    console.setFormatter(formatter)
-    logging.getLogger('').addHandler(console)
-    logging.getLogger('matplotlib.font_manager').disabled = True
+    setup_logger(args.save_dir, verbose=args.verbose)
 
-    # Save run settings
-    logging.info(args)
+    # Save run settings (full args only in file / yaml)
+    logging.debug('Full args: %s', args)
     with open(os.path.join(args.save_dir, 'args.yaml'), 'w') as f:
         yaml.dump(vars(args), f, sort_keys=False)
 
@@ -53,27 +96,36 @@ def train(args):
     zipdir(pathlib.Path().absolute(), zipf, include_format=['.py'])
     zipf.close()
 
+    logging.info(SEP)
+    logging.info(' GETNext training')
+    logging.info(f' save_dir : {args.save_dir}')
+    logging.info(f' device   : {args.device}')
+    logging.info(f' epochs   : {args.epochs}  batch={args.batch}  lr={args.lr}')
+    logging.info(f' train    : {args.data_train}')
+    logging.info(f' val      : {args.data_val}')
+    logging.info(SEP)
+
     # %% ====================== Load data ======================
     # 步骤1: 读取签到轨迹 CSV
+    logging.info('[1/4] Loading trajectories & POI graph...')
     train_df = pd.read_csv(args.data_train)
     val_df = pd.read_csv(args.data_val)
 
     # 步骤2: 加载全局轨迹流图 (由 build_graph.py 从 train 构建)
-    print('Loading POI graph...')
     raw_A = load_graph_adj_mtx(args.data_adj_mtx)  # (N_poi, N_poi)，边权=转移频次
     raw_X = load_graph_node_features(args.data_node_feats,
                                      args.feature1,
                                      args.feature2,
                                      args.feature3,
                                      args.feature4)  # (N_poi, 4)
-    logging.info(
+    logging.debug(
         f"raw_X.shape: {raw_X.shape}; "
         f"Four features: {args.feature1}, {args.feature2}, {args.feature3}, {args.feature4}.")
-    logging.info(f"raw_A.shape: {raw_A.shape}; Edge from row_index to col_index with weight (frequency).")
+    logging.debug(f"raw_A.shape: {raw_A.shape}; Edge from row_index to col_index with weight (frequency).")
     num_pois = raw_X.shape[0]  # N_poi
 
     # 步骤3: 对 POI 类别做 One-Hot，拼回节点特征矩阵 X
-    logging.info('One-hot encoding poi categories id')
+    logging.debug('One-hot encoding poi categories id')
     one_hot_encoder = OneHotEncoder()
     cat_list = list(raw_X[:, 1])
     one_hot_encoder.fit(list(map(lambda x: [x], cat_list)))
@@ -84,15 +136,16 @@ def train(args):
     X[:, 0] = raw_X[:, 0]
     X[:, 1:num_cats + 1] = one_hot_rlt
     X[:, num_cats + 1:] = raw_X[:, 2:]
-    logging.info(f"After one hot encoding poi cat, X.shape: {X.shape}")
-    logging.info(f'POI categories: {list(one_hot_encoder.categories_[0])}')
+    logging.debug(f"After one hot encoding poi cat, X.shape: {X.shape}")
+    logging.debug(f'POI categories: {list(one_hot_encoder.categories_[0])}')
     # Save ont-hot encoder
     with open(os.path.join(args.save_dir, 'one-hot-encoder.pkl'), "wb") as f:
         pickle.dump(one_hot_encoder, f)
 
     # 步骤4: 邻接矩阵做 GCN 用的随机游走归一化拉普拉斯
-    print('Laplician matrix...')
     A = calculate_laplacian_matrix(raw_A, mat_type='hat_rw_normd_lap_mat')  # (N_poi, N_poi)
+    logging.info(f'        POIs={num_pois}  cats={num_cats}  '
+                 f'train_rows={len(train_df)}  val_rows={len(val_df)}')
 
     # 步骤5: 构建 id ↔ index 映射字典
     nodes_df = pd.read_csv(args.data_node_feats)
@@ -127,7 +180,8 @@ def train(args):
             self.input_seqs = []
             self.label_seqs = []
 
-            for traj_id in tqdm(set(train_df['trajectory_id'].tolist())):
+            for traj_id in tqdm(set(train_df['trajectory_id'].tolist()),
+                                desc='Build train set', leave=False, dynamic_ncols=True):
                 traj_df = train_df[train_df['trajectory_id'] == traj_id]
                 poi_ids = traj_df['POI_id'].to_list()
                 poi_idxs = [poi_id2idx_dict[each] for each in poi_ids]  # 长度 L
@@ -162,7 +216,8 @@ def train(args):
             self.input_seqs = []
             self.label_seqs = []
 
-            for traj_id in tqdm(set(df['trajectory_id'].tolist())):
+            for traj_id in tqdm(set(df['trajectory_id'].tolist()),
+                                desc='Build val set', leave=False, dynamic_ncols=True):
                 user_id = traj_id.split('_')[0]
 
                 # 跳过训练集中未出现的用户
@@ -202,9 +257,11 @@ def train(args):
             return (self.traj_seqs[index], self.input_seqs[index], self.label_seqs[index])
 
     # %% ====================== Define dataloader ======================
-    print('Prepare dataloader...')
+    logging.info('[2/4] Building dataloaders...')
     train_dataset = TrajectoryDatasetTrain(train_df)
     val_dataset = TrajectoryDatasetVal(val_df)
+    logging.info(f'        train_trajs={len(train_dataset)}  val_trajs={len(val_dataset)}  '
+                 f'users={len(user_id2idx_dict)}')
 
     train_loader = DataLoader(train_dataset,
                               batch_size=args.batch,
@@ -219,6 +276,7 @@ def train(args):
 
     # %% ====================== Build Models ======================
     # 步骤6: 图特征/邻接转 Tensor，并构建各子模块
+    logging.info('[3/4] Building models...')
     if isinstance(X, np.ndarray):
         X = torch.from_numpy(X)  # (N_poi, F)
         A = torch.from_numpy(A)  # (N_poi, N_poi)
@@ -275,13 +333,13 @@ def train(args):
     criterion_cat = nn.CrossEntropyLoss(ignore_index=-1)
     criterion_time = maksed_mse_loss  # 忽略 target==-1 的时间 MSE
 
+    # Prefer no-verbose scheduler API (PyTorch 2.x); fall back for older installs.
     try:
         lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, 'min', verbose=True, factor=args.lr_scheduler_factor)
-    except TypeError:
-        # PyTorch 2.x removed `verbose` from ReduceLROnPlateau
-        lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, 'min', factor=args.lr_scheduler_factor)
+    except TypeError:
+        lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, 'min', verbose=False, factor=args.lr_scheduler_factor)
 
     # %% Tool functions for training
     def input_traj_to_embeddings(sample, poi_embeddings):
@@ -386,8 +444,9 @@ def train(args):
     # For saving ckpt
     max_val_score = -np.inf
 
+    logging.info('[4/4] Start training...')
     for epoch in range(args.epochs):
-        logging.info(f"{'*' * 50}Epoch:{epoch:03d}{'*' * 50}\n")
+        logging.debug(f"{'*' * 50}Epoch:{epoch:03d}{'*' * 50}")
         poi_embed_model.train()
         node_attn_model.train()
         user_embed_model.train()
@@ -409,7 +468,11 @@ def train(args):
         train_batches_cat_loss_list = []
         src_mask = seq_model.generate_square_subsequent_mask(args.batch).to(args.device)  # (B, B)
         # ---------- 训练 batch 循环 ----------
-        for b_idx, batch in enumerate(train_loader):
+        train_pbar = tqdm(train_loader,
+                          desc=f'Epoch {epoch + 1}/{args.epochs} train',
+                          leave=False,
+                          dynamic_ncols=True)
+        for b_idx, batch in enumerate(train_pbar):
             if len(batch) != args.batch:
                 src_mask = seq_model.generate_square_subsequent_mask(len(batch)).to(args.device)
 
@@ -492,7 +555,8 @@ def train(args):
                 top20_acc += top_k_acc_last_timestep(label_pois, pred_pois, k=20)
                 mAP20 += mAP_metric_last_timestep(label_pois, pred_pois, k=20)
                 mrr += MRR_metric_last_timestep(label_pois, pred_pois)
-            train_batches_top1_acc_list.append(top1_acc / len(batch_label_pois))
+            batch_top1 = top1_acc / len(batch_label_pois)
+            train_batches_top1_acc_list.append(batch_top1)
             train_batches_top5_acc_list.append(top5_acc / len(batch_label_pois))
             train_batches_top10_acc_list.append(top10_acc / len(batch_label_pois))
             train_batches_top20_acc_list.append(top20_acc / len(batch_label_pois))
@@ -503,32 +567,39 @@ def train(args):
             train_batches_time_loss_list.append(loss_time.detach().cpu().numpy())
             train_batches_cat_loss_list.append(loss_cat.detach().cpu().numpy())
 
-            # Report training progress
-            if (b_idx % (args.batch * 5)) == 0:
+            train_pbar.set_postfix(
+                loss=f'{loss.item():.2f}',
+                avg=f'{float(np.mean(train_batches_loss_list)):.2f}',
+                top1=f'{batch_top1:.3f}',
+                refresh=False)
+
+            # Optional detailed sample dump (file + console when --verbose)
+            if args.verbose and (b_idx % max(args.batch * 5, 1)) == 0:
                 sample_idx = 0
                 batch_pred_pois_wo_attn = y_pred_poi.detach().cpu().numpy()
-                logging.info(f'Epoch:{epoch}, batch:{b_idx}, '
-                             f'train_batch_loss:{loss.item():.2f}, '
-                             f'train_batch_top1_acc:{top1_acc / len(batch_label_pois):.2f}, '
-                             f'train_move_loss:{np.mean(train_batches_loss_list):.2f}\n'
-                             f'train_move_poi_loss:{np.mean(train_batches_poi_loss_list):.2f}\n'
-                             f'train_move_time_loss:{np.mean(train_batches_time_loss_list):.2f}\n'
-                             f'train_move_top1_acc:{np.mean(train_batches_top1_acc_list):.4f}\n'
-                             f'train_move_top5_acc:{np.mean(train_batches_top5_acc_list):.4f}\n'
-                             f'train_move_top10_acc:{np.mean(train_batches_top10_acc_list):.4f}\n'
-                             f'train_move_top20_acc:{np.mean(train_batches_top20_acc_list):.4f}\n'
-                             f'train_move_mAP20:{np.mean(train_batches_mAP20_list):.4f}\n'
-                             f'train_move_MRR:{np.mean(train_batches_mrr_list):.4f}\n'
-                             f'traj_id:{batch[sample_idx][0]}\n'
-                             f'input_seq: {batch[sample_idx][1]}\n'
-                             f'label_seq:{batch[sample_idx][2]}\n'
-                             f'pred_seq_poi_wo_attn:{list(np.argmax(batch_pred_pois_wo_attn, axis=2)[sample_idx][:batch_seq_lens[sample_idx]])} \n'
-                             f'pred_seq_poi:{list(np.argmax(batch_pred_pois, axis=2)[sample_idx][:batch_seq_lens[sample_idx]])} \n'
-                             f'label_seq_cat:{[poi_idx2cat_idx_dict[each[0]] for each in batch[sample_idx][2]]}\n'
-                             f'pred_seq_cat:{list(np.argmax(batch_pred_cats, axis=2)[sample_idx][:batch_seq_lens[sample_idx]])} \n'
-                             f'label_seq_time:{list(batch_seq_labels_time[sample_idx].numpy()[:batch_seq_lens[sample_idx]])}\n'
-                             f'pred_seq_time:{list(np.squeeze(batch_pred_times)[sample_idx][:batch_seq_lens[sample_idx]])} \n' +
-                             '=' * 100)
+                logging.debug(
+                    f'Epoch:{epoch}, batch:{b_idx}, '
+                    f'train_batch_loss:{loss.item():.2f}, '
+                    f'train_batch_top1_acc:{batch_top1:.2f}, '
+                    f'train_move_loss:{np.mean(train_batches_loss_list):.2f}\n'
+                    f'train_move_poi_loss:{np.mean(train_batches_poi_loss_list):.2f}\n'
+                    f'train_move_time_loss:{np.mean(train_batches_time_loss_list):.2f}\n'
+                    f'train_move_top1_acc:{np.mean(train_batches_top1_acc_list):.4f}\n'
+                    f'train_move_top5_acc:{np.mean(train_batches_top5_acc_list):.4f}\n'
+                    f'train_move_top10_acc:{np.mean(train_batches_top10_acc_list):.4f}\n'
+                    f'train_move_top20_acc:{np.mean(train_batches_top20_acc_list):.4f}\n'
+                    f'train_move_mAP20:{np.mean(train_batches_mAP20_list):.4f}\n'
+                    f'train_move_MRR:{np.mean(train_batches_mrr_list):.4f}\n'
+                    f'traj_id:{batch[sample_idx][0]}\n'
+                    f'input_seq: {batch[sample_idx][1]}\n'
+                    f'label_seq:{batch[sample_idx][2]}\n'
+                    f'pred_seq_poi_wo_attn:{list(np.argmax(batch_pred_pois_wo_attn, axis=2)[sample_idx][:batch_seq_lens[sample_idx]])} \n'
+                    f'pred_seq_poi:{list(np.argmax(batch_pred_pois, axis=2)[sample_idx][:batch_seq_lens[sample_idx]])} \n'
+                    f'label_seq_cat:{[poi_idx2cat_idx_dict[each[0]] for each in batch[sample_idx][2]]}\n'
+                    f'pred_seq_cat:{list(np.argmax(batch_pred_cats, axis=2)[sample_idx][:batch_seq_lens[sample_idx]])} \n'
+                    f'label_seq_time:{list(batch_seq_labels_time[sample_idx].numpy()[:batch_seq_lens[sample_idx]])}\n'
+                    f'pred_seq_time:{list(np.squeeze(batch_pred_times)[sample_idx][:batch_seq_lens[sample_idx]])}'
+                )
 
         # train end --------------------------------------------------------------------------------------------------------
         poi_embed_model.eval()
@@ -551,7 +622,11 @@ def train(args):
         val_batches_cat_loss_list = []
         src_mask = seq_model.generate_square_subsequent_mask(args.batch).to(args.device)
         # ---------- 验证 batch 循环 (无反向传播，流程与训练对称) ----------
-        for vb_idx, batch in enumerate(val_loader):
+        val_pbar = tqdm(val_loader,
+                        desc=f'Epoch {epoch + 1}/{args.epochs} val  ',
+                        leave=False,
+                        dynamic_ncols=True)
+        for vb_idx, batch in enumerate(val_pbar):
             if len(batch) != args.batch:
                 src_mask = seq_model.generate_square_subsequent_mask(len(batch)).to(args.device)
 
@@ -620,7 +695,8 @@ def train(args):
                 top20_acc += top_k_acc_last_timestep(label_pois, pred_pois, k=20)
                 mAP20 += mAP_metric_last_timestep(label_pois, pred_pois, k=20)
                 mrr += MRR_metric_last_timestep(label_pois, pred_pois)
-            val_batches_top1_acc_list.append(top1_acc / len(batch_label_pois))
+            batch_top1 = top1_acc / len(batch_label_pois)
+            val_batches_top1_acc_list.append(batch_top1)
             val_batches_top5_acc_list.append(top5_acc / len(batch_label_pois))
             val_batches_top10_acc_list.append(top10_acc / len(batch_label_pois))
             val_batches_top20_acc_list.append(top20_acc / len(batch_label_pois))
@@ -631,32 +707,38 @@ def train(args):
             val_batches_time_loss_list.append(loss_time.detach().cpu().numpy())
             val_batches_cat_loss_list.append(loss_cat.detach().cpu().numpy())
 
-            # Report validation progress
-            if (vb_idx % (args.batch * 2)) == 0:
+            val_pbar.set_postfix(
+                loss=f'{loss.item():.2f}',
+                avg=f'{float(np.mean(val_batches_loss_list)):.2f}',
+                top1=f'{batch_top1:.3f}',
+                refresh=False)
+
+            if args.verbose and (vb_idx % max(args.batch * 2, 1)) == 0:
                 sample_idx = 0
                 batch_pred_pois_wo_attn = y_pred_poi.detach().cpu().numpy()
-                logging.info(f'Epoch:{epoch}, batch:{vb_idx}, '
-                             f'val_batch_loss:{loss.item():.2f}, '
-                             f'val_batch_top1_acc:{top1_acc / len(batch_label_pois):.2f}, '
-                             f'val_move_loss:{np.mean(val_batches_loss_list):.2f} \n'
-                             f'val_move_poi_loss:{np.mean(val_batches_poi_loss_list):.2f} \n'
-                             f'val_move_time_loss:{np.mean(val_batches_time_loss_list):.2f} \n'
-                             f'val_move_top1_acc:{np.mean(val_batches_top1_acc_list):.4f} \n'
-                             f'val_move_top5_acc:{np.mean(val_batches_top5_acc_list):.4f} \n'
-                             f'val_move_top10_acc:{np.mean(val_batches_top10_acc_list):.4f} \n'
-                             f'val_move_top20_acc:{np.mean(val_batches_top20_acc_list):.4f} \n'
-                             f'val_move_mAP20:{np.mean(val_batches_mAP20_list):.4f} \n'
-                             f'val_move_MRR:{np.mean(val_batches_mrr_list):.4f} \n'
-                             f'traj_id:{batch[sample_idx][0]}\n'
-                             f'input_seq:{batch[sample_idx][1]}\n'
-                             f'label_seq:{batch[sample_idx][2]}\n'
-                             f'pred_seq_poi_wo_attn:{list(np.argmax(batch_pred_pois_wo_attn, axis=2)[sample_idx][:batch_seq_lens[sample_idx]])} \n'
-                             f'pred_seq_poi:{list(np.argmax(batch_pred_pois, axis=2)[sample_idx][:batch_seq_lens[sample_idx]])} \n'
-                             f'label_seq_cat:{[poi_idx2cat_idx_dict[each[0]] for each in batch[sample_idx][2]]}\n'
-                             f'pred_seq_cat:{list(np.argmax(batch_pred_cats, axis=2)[sample_idx][:batch_seq_lens[sample_idx]])} \n'
-                             f'label_seq_time:{list(batch_seq_labels_time[sample_idx].numpy()[:batch_seq_lens[sample_idx]])}\n'
-                             f'pred_seq_time:{list(np.squeeze(batch_pred_times)[sample_idx][:batch_seq_lens[sample_idx]])} \n' +
-                             '=' * 100)
+                logging.debug(
+                    f'Epoch:{epoch}, batch:{vb_idx}, '
+                    f'val_batch_loss:{loss.item():.2f}, '
+                    f'val_batch_top1_acc:{batch_top1:.2f}, '
+                    f'val_move_loss:{np.mean(val_batches_loss_list):.2f} \n'
+                    f'val_move_poi_loss:{np.mean(val_batches_poi_loss_list):.2f} \n'
+                    f'val_move_time_loss:{np.mean(val_batches_time_loss_list):.2f} \n'
+                    f'val_move_top1_acc:{np.mean(val_batches_top1_acc_list):.4f} \n'
+                    f'val_move_top5_acc:{np.mean(val_batches_top5_acc_list):.4f} \n'
+                    f'val_move_top10_acc:{np.mean(val_batches_top10_acc_list):.4f} \n'
+                    f'val_move_top20_acc:{np.mean(val_batches_top20_acc_list):.4f} \n'
+                    f'val_move_mAP20:{np.mean(val_batches_mAP20_list):.4f} \n'
+                    f'val_move_MRR:{np.mean(val_batches_mrr_list):.4f} \n'
+                    f'traj_id:{batch[sample_idx][0]}\n'
+                    f'input_seq:{batch[sample_idx][1]}\n'
+                    f'label_seq:{batch[sample_idx][2]}\n'
+                    f'pred_seq_poi_wo_attn:{list(np.argmax(batch_pred_pois_wo_attn, axis=2)[sample_idx][:batch_seq_lens[sample_idx]])} \n'
+                    f'pred_seq_poi:{list(np.argmax(batch_pred_pois, axis=2)[sample_idx][:batch_seq_lens[sample_idx]])} \n'
+                    f'label_seq_cat:{[poi_idx2cat_idx_dict[each[0]] for each in batch[sample_idx][2]]}\n'
+                    f'pred_seq_cat:{list(np.argmax(batch_pred_cats, axis=2)[sample_idx][:batch_seq_lens[sample_idx]])} \n'
+                    f'label_seq_time:{list(batch_seq_labels_time[sample_idx].numpy()[:batch_seq_lens[sample_idx]])}\n'
+                    f'pred_seq_time:{list(np.squeeze(batch_pred_times)[sample_idx][:batch_seq_lens[sample_idx]])}'
+                )
         # valid end --------------------------------------------------------------------------------------------------------
 
         # Calculate epoch metrics
@@ -709,31 +791,25 @@ def train(args):
 
         # Learning rate schuduler
         lr_scheduler.step(monitor_loss)
+        current_lr = optimizer.param_groups[0]['lr']
 
-        # Print epoch results
-        logging.info(f"Epoch {epoch}/{args.epochs}\n"
-                     f"train_loss:{epoch_train_loss:.4f}, "
-                     f"train_poi_loss:{epoch_train_poi_loss:.4f}, "
-                     f"train_time_loss:{epoch_train_time_loss:.4f}, "
-                     f"train_cat_loss:{epoch_train_cat_loss:.4f}, "
-                     f"train_top1_acc:{epoch_train_top1_acc:.4f}, "
-                     f"train_top5_acc:{epoch_train_top5_acc:.4f}, "
-                     f"train_top10_acc:{epoch_train_top10_acc:.4f}, "
-                     f"train_top20_acc:{epoch_train_top20_acc:.4f}, "
-                     f"train_mAP20:{epoch_train_mAP20:.4f}, "
-                     f"train_mrr:{epoch_train_mrr:.4f}\n"
-                     f"val_loss: {epoch_val_loss:.4f}, "
-                     f"val_poi_loss: {epoch_val_poi_loss:.4f}, "
-                     f"val_time_loss: {epoch_val_time_loss:.4f}, "
-                     f"val_cat_loss: {epoch_val_cat_loss:.4f}, "
-                     f"val_top1_acc:{epoch_val_top1_acc:.4f}, "
-                     f"val_top5_acc:{epoch_val_top5_acc:.4f}, "
-                     f"val_top10_acc:{epoch_val_top10_acc:.4f}, "
-                     f"val_top20_acc:{epoch_val_top20_acc:.4f}, "
-                     f"val_mAP20:{epoch_val_mAP20:.4f}, "
-                     f"val_mrr:{epoch_val_mrr:.4f}")
+        train_m = {
+            'loss': epoch_train_loss, 'poi': epoch_train_poi_loss,
+            'time': epoch_train_time_loss, 'cat': epoch_train_cat_loss,
+            'top1': epoch_train_top1_acc, 'top5': epoch_train_top5_acc,
+            'top10': epoch_train_top10_acc, 'top20': epoch_train_top20_acc,
+            'map20': epoch_train_mAP20, 'mrr': epoch_train_mrr,
+        }
+        val_m = {
+            'loss': epoch_val_loss, 'poi': epoch_val_poi_loss,
+            'time': epoch_val_time_loss, 'cat': epoch_val_cat_loss,
+            'top1': epoch_val_top1_acc, 'top5': epoch_val_top5_acc,
+            'top10': epoch_val_top10_acc, 'top20': epoch_val_top20_acc,
+            'map20': epoch_val_mAP20, 'mrr': epoch_val_mrr,
+        }
 
         # Save poi and user embeddings
+        saved_best = False
         if args.save_embeds:
             embeddings_save_dir = os.path.join(args.save_dir, 'embeddings')
             if not os.path.exists(embeddings_save_dir): os.makedirs(embeddings_save_dir)
@@ -824,6 +900,11 @@ def train(args):
                 with open(rf"{model_save_dir}/best_epoch.txt", 'w') as f:
                     print(state_dict['epoch_val_metrics'], file=f)
                 max_val_score = monitor_score
+                saved_best = True
+
+        logging.info(format_epoch_summary(
+            epoch, args.epochs, current_lr, train_m, val_m,
+            saved_best=saved_best, best_score=max_val_score if saved_best else None))
 
         # Save train/val metrics for plotting purpose
         with open(os.path.join(args.save_dir, 'metrics-train.txt'), "w") as f:
@@ -852,8 +933,14 @@ def train(args):
             print(f'val_epochs_mAP20_list={[float(f"{each:.4f}") for each in val_epochs_mAP20_list]}', file=f)
             print(f'val_epochs_mrr_list={[float(f"{each:.4f}") for each in val_epochs_mrr_list]}', file=f)
 
+    logging.info(f'Training finished. Best val score={max_val_score:.4f}')
+    logging.info(f'Checkpoints: {os.path.join(args.save_dir, "checkpoints")}')
+
 
 if __name__ == '__main__':
+    # Keep console focused on training progress (model warnings go to log file only).
+    warnings.filterwarnings('ignore', message='.*enable_nested_tensor.*')
+    warnings.filterwarnings('ignore', message='.*verbose parameter is deprecated.*')
     args = parameter_parser()
     if args.no_cuda or not torch.cuda.is_available():
         args.device = torch.device('cpu')
