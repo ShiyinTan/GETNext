@@ -146,6 +146,10 @@ def parameter_parser():
     parser.add_argument('--no-cuda',
                         action='store_true',
                         default=False, help='Disables CUDA training.')
+    parser.add_argument('--verbose',
+                        action='store_true',
+                        default=False,
+                        help='Print detailed per-batch sample dumps (noisy).')
     parser.add_argument('--mode',
                         type=str,
                         default='client',
