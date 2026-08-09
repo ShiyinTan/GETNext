@@ -275,8 +275,13 @@ def train(args):
     criterion_cat = nn.CrossEntropyLoss(ignore_index=-1)
     criterion_time = maksed_mse_loss  # 忽略 target==-1 的时间 MSE
 
-    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, 'min', verbose=True, factor=args.lr_scheduler_factor)
+    try:
+        lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, 'min', verbose=True, factor=args.lr_scheduler_factor)
+    except TypeError:
+        # PyTorch 2.x removed `verbose` from ReduceLROnPlateau
+        lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, 'min', factor=args.lr_scheduler_factor)
 
     # %% Tool functions for training
     def input_traj_to_embeddings(sample, poi_embeddings):
@@ -850,6 +855,10 @@ def train(args):
 
 if __name__ == '__main__':
     args = parameter_parser()
+    if args.no_cuda or not torch.cuda.is_available():
+        args.device = torch.device('cpu')
+    else:
+        args.device = torch.device(args.device)
     # The name of node features in NYC/graph_X.csv
     args.feature1 = 'checkin_cnt'
     args.feature2 = 'poi_catid'
