@@ -2,6 +2,7 @@ import logging
 import os
 import pathlib
 import pickle
+import warnings
 import zipfile
 from pathlib import Path
 
@@ -332,13 +333,13 @@ def train(args):
     criterion_cat = nn.CrossEntropyLoss(ignore_index=-1)
     criterion_time = maksed_mse_loss  # 忽略 target==-1 的时间 MSE
 
+    # Prefer no-verbose scheduler API (PyTorch 2.x); fall back for older installs.
     try:
         lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, 'min', verbose=True, factor=args.lr_scheduler_factor)
-    except TypeError:
-        # PyTorch 2.x removed `verbose` from ReduceLROnPlateau
-        lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, 'min', factor=args.lr_scheduler_factor)
+    except TypeError:
+        lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, 'min', verbose=False, factor=args.lr_scheduler_factor)
 
     # %% Tool functions for training
     def input_traj_to_embeddings(sample, poi_embeddings):
@@ -937,6 +938,9 @@ def train(args):
 
 
 if __name__ == '__main__':
+    # Keep console focused on training progress (model warnings go to log file only).
+    warnings.filterwarnings('ignore', message='.*enable_nested_tensor.*')
+    warnings.filterwarnings('ignore', message='.*verbose parameter is deprecated.*')
     args = parameter_parser()
     if args.no_cuda or not torch.cuda.is_available():
         args.device = torch.device('cpu')
