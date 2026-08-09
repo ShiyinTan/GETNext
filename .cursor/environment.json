@@ -1,3 +1,4 @@
 {
-  "install": "bash scripts/setup_cloud_env.sh"
+  "install": "bash scripts/setup_cloud_env.sh",
+  "start": "bash scripts/ensure_nyc_dataset.sh"
 }
