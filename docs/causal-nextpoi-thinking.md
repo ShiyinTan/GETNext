@@ -233,14 +233,193 @@ Area 常常是 **混杂因子** 或 **效应修饰因子（moderator）**：
 
 ---
 
-## 6. 三者一起建模时的统一框架
+## 6. 不止 IPS：SCM 因果图 + Deconfounded Training + 表征因果
+
+**可以，而且往往比纯 IPS 更适合 GETNext。**
+
+IPS 把偏差当成“采样权重”问题：纠正 \(P(\text{observe})\) 与目标分布的差异。但 Next-POI 里，距离 / 流行度 / area 不只是采样偏差，它们是**进入数据生成过程的结构化混杂（或中介）**。此时更自然的路线是：
+
+1. 画 **SCM / 因果图**，标明 \(U\)（偏好）、\(C\)（混杂：access/pop/area）、\(X\)（观测历史与图特征）、\(Y\)（下一 POI）；
+2. 用后门/前门/干预公式确定**可识别的去混淆目标**；
+3. 用 **deconfounded training** 或 **representation-based** 方法，让编码器学到对 \(C\) 去混淆（或与 \(C\) 解耦）的表征，再接到 GETNext 的预测头。
+
+IPS 与这类方法**互补**：IPS 改损失权重；SCM/表征方法改**学什么表示、在什么条件分布下预测**。可以只做后者，也可以表征去混淆 + 轻度 IPS。
+
+### 6.1 先把因果图写清楚（推荐的最小 SCM）
+
+把一次“历史 → 下一 POI”写成：
+
+```text
+         Z (user latent interest)          C_pop (POI popularity)
+                  │                              │
+                  │         ┌────────────────────┤
+                  ▼         ▼                    ▼
+   H (history) ──► X_pref ──► Y (next POI) ◄── X_ctx
+                  ▲         ▲                    ▲
+                  │         │                    │
+            C_area         C_access ◄── Dist, time budget
+         (land-use)              ▲
+                                 │
+                            Area, home/work anchors
+```
+
+约定：
+
+| 符号 | 含义 | GETNext 里大致对应 |
+|------|------|-------------------|
+| \(Z\) | 用户稳定兴趣（想估计的因果因子） | `UserEmbeddings` 的兴趣子空间 + 序列里与 cat 相关的部分 |
+| \(C = \{C_{access}, C_{pop}, C_{area}\}\) | 混杂 / 场景约束 | 距离与活动半径；`checkin_cnt` / 边权；区域标签 |
+| \(X\) | 编码器输入 | 轨迹 POI/time/cat 嵌入、GCN(`X`,`A`)、`NodeAttnMap` |
+| \(Y\) | 下一 POI（或下一类别） | `decoder_poi` / `decoder_cat` |
+
+**识别问题（要预测的量）：**
+
+- 若任务是“真实下一跳”：估计 \(P(Y \mid H)\) 即可，但内部仍应用 SCM 避免把 \(C\) 误当成 \(Z\) 的全部内容（否则长尾用户差）。
+- 若任务是“偏好驱动的下一跳 / 去混淆推荐”：更关心  
+  \[
+  P(Y \mid do(Z),\; H_{\setminus C})
+  \quad\text{或}\quad
+  P(Y \mid X_{pref},\; do(C=\bar{c}))
+  \]
+  即阻断 \(C \to Y\) 的后门路径后，看偏好表征还能不能预测。
+
+后门调整的离散版（\(C\) 可分层时）：
+
+\[
+P(Y \mid do(X_{pref}))
+= \sum_c P(Y \mid X_{pref}, c)\, P(c)
+\]
+
+这就是许多 **deconfounded recommender** 的公式原型：不是按 \(P(c \mid X)\) 加权（那会保留混杂），而是按**边缘** \(P(c)\)（或干预分布）积分。
+
+### 6.2 Deconfounded Training：在 GETNext 上怎么做
+
+核心思想：**训练时显式条件化混杂 \(C\)，预测/推理时对 \(C\) 做边缘化或干预**，使主表征无法走“偷懒走 \(C\)”的捷径。
+
+#### 方案 A：后门调整头（Backdoor-adjusted prediction）
+
+1. 为每个训练样本构造混杂向量 \(c\)：距离桶、`log pop(p)`、`area_id`（from/to）、时段等。
+2. 预测头改为条件头：\(P(Y \mid h, c)\)，其中 \(h\) 是 Transformer 输出的轨迹表征。
+3. 推理时：
+   - **写实**：代入真实 \(c\)；
+   - **去混淆**：  
+     \[
+     P(Y \mid h) = \sum_{c'} P(Y \mid h, c')\, \hat{P}(c')
+     \]
+     或取均匀 / 反事实 \(c'=\bar{c}\)（如所有候选同一 pop、同一距离环带中位数）。
+
+接到现有代码：不必重写整网。可在 `y_pred_poi` 上增加一项 `f(c)` 的条件偏置，或对 decoder 做 FiLM/拼接 \(c\)；去混淆推理时对 \(c\) 的若干原型做平均。
+
+#### 方案 B：混杂条件化 + 不变风险（Deconfounded + IRM / Group DRO）
+
+把 \(C\) 的不同取值看作**环境** \(e\)（近 vs 远、热门 vs 长尾、商圈 vs 居民区）：
+
+\[
+\min_\theta \sum_e \mathcal{L}_e(\theta)
++ \lambda \cdot \text{Penalty}(\{\nabla_{w|e}\})
+\]
+
+要求同一套偏好表征在多环境下都能预测 \(Y\)（或下一类别）。这直接针对“模型只在近邻/热门环境好用”的问题。
+
+GETNext 落地：按距离桶 × 流行度四分位 分组算 CE，再加 Group DRO 或 IRMv1 惩罚；类别头作不变预测目标往往比 POI_id 更稳。
+
+#### 方案 C：对抗 / 互信息去混淆（Adversarial deconfounding）
+
+编码器出 \(h = \mathrm{Enc}(H)\)，额外判别器 \(D\) 试图从 \(h\) 预测 \(C\)（距离桶、pop 桶、area）：
+
+\[
+\min_{\mathrm{Enc},\,\mathrm{Pred}}\;
+\max_D\;
+\mathcal{L}_{Y}(h) - \lambda\, \mathcal{L}_{C}(D(h))
+\]
+
+迫使 \(h\) 对 \(C\) 信息最少（近似 \(h \perp C\)），再由单独的 \(g(C)\) 支路提供可达性/流行度分数（见 §7 的分数分解）。  
+这就是典型的 **representation-based causal** 做法：把“偏好表征”和“混杂表征”拆开。
+
+注意：完全 \(h \perp C\) 可能过强——兴趣本身与常驻 area 相关。更稳妥的是 **partial disentanglement**：
+
+- \(h = [h_z ; h_c]\)，只对 \(h_z\) 做对抗去 \(C\)；
+- \(h_c\) 允许预测 \(C\)，并单独进入 access/pop/area 支路；
+- 预测 \(Y\) 时写实模式用两者，偏好模式只用 \(h_z\)。
+
+#### 方案 D：结构化因果表征（SCM-shaped encoders）
+
+不只“去相关”，而是按 SCM 搭模块，使干预有明确旋钮：
+
+```text
+H ──► Enc_Z ──► h_z ──┐
+                       ├──► Pred_Y
+C ──► Enc_C ──► h_c ──┘
+         │
+         └──► (optional) recon C / predict dist, pop, area
+```
+
+- 训练：`L_Y(h_z, h_c) + L_recon(C) + L_ortho(h_z, h_c) + L_inv(h_z across env)`  
+- 干预：`do(C=c*)` = 把 `h_c` 换成编码 `c*` 的向量，保持 `h_z` 不变，看 top-k 如何变。  
+这比 IPS 更可解释，也更适合回答“若可达性相同，用户还会去吗？”
+
+### 6.3 常见表征因果算法族，哪些能用
+
+| 算法族 | 想法 | 是否适合 Next-POI / GETNext | 备注 |
+|--------|------|------------------------------|------|
+| Backdoor adjustment / PDA 类 | \(\sum_c P(Y\|X,c)P(c)\) | ✅ 很适合 | pop/距离/area 可离散分层；推理可边缘化 |
+| DecConfounder / 替代混杂因子 | 用多因多果学替代混杂 \(\hat{C}\) | ⚠️ 可试 | 需多个“因果”侧变量；POI 图上可把多用户转移当多因 |
+| Disentangled / adversarial rep | \(h_z \perp C\)，\(h_c\) 吃混杂 | ✅ 推荐 | 与 User/POI 双塔或双头天然兼容 |
+| IRM / V-REx / Group DRO | 跨环境不变预测 | ✅ 推荐 | 环境=距离×pop×area 切片 |
+| Front-door | 经中介 \(M\) 识别 | ⚠️ 条件苛刻 | 若用“意图类别”作 \(M\)，需假设类别挡住全部偏好→POI 路径且无 \(C\to M\) 后门——很难严格成立，可作启发（先预测 cat 再 POI） |
+| Causal discovery（从数据学图） | 学 DAG 再建模型 | ❌ 优先级低 | 轨迹+强选择偏差下图难可靠；**专家因果图 + 敏感分析**更务实 |
+| IPS / SNIPS | 按倾向重加权 | ✅ 可作辅助 | 方差大；作表征方法的补充而非唯一手段 |
+| Counterfactual data augmentation | 干预 \(C\) 后合成样本 | ✅ | 同距离环带替换、同 area 替换热门 POI 等 |
+
+**结论：**  
+用 **SCM 建模 + deconfounded training（后门调整 / 对抗解耦 / 跨环境不变）** 完全可行，且比“只上 IPS”更贴合“邻近与热门被学成偏好”的机制。IPS 保留为对极端稀有桶的稳定器即可。
+
+### 6.4 相对纯 IPS 的优劣
+
+| | IPS | SCM + Deconfounded / Rep-based |
+|--|-----|--------------------------------|
+| 建模对象 | 采样概率 | 数据生成与混杂路径 |
+| 方差 | 易爆，需裁剪 | 通常更稳，但对抗训练可能不稳 |
+| 可解释干预 | 弱 | 强（`do(C)` 有明确模块） |
+| 实现成本 | 低 | 中（要定义 \(C\)、改头/损失） |
+| 与 GETNext | 改 CE 权重即可 | 改表征与 `adjust_pred_prob_by_graph` 的信息来源 |
+
+推荐默认组合：
+
+1. **主路径**：双表征 \(h_z, h_c\) + 后门调整或写实/偏好双模式推理；  
+2. **正则**：跨环境 Group DRO（或轻量 IRM）；  
+3. **可选**：对最稀有距离桶加裁剪 IPS。
+
+### 6.5 最小可跑通的实现草图（仍挂在 GETNext 上）
+
+```text
+现有:  GCN(X,A) → poi_emb
+       Transformer(seq) → h
+       y = decoder(h) + NodeAttnMap(cur)
+
+改为:
+       C = [dist_bucket, log_pop, area_from, area_to, hour]
+       h → split/project → h_z, h_c
+       L = CE(y | h_z, h_c)
+         + λ1 * CE_adv(C | h_z)     # 上升沿训练 Enc，使 h_z 难测 C
+         + λ2 * CE(C | h_c)         # h_c 要能预测混杂
+         + λ3 * GroupDRO(CE by env)
+       推理_deconf: y ∝ softmax(decoder(h_z, c̄) + α * flow_residual)
+       推理_factual: y ∝ softmax(decoder(h_z, h_c) + attn_map)
+```
+
+其中 `flow_residual` 建议是对 `A` 做过 pop/距离归一化后的残差流，避免 `NodeAttnMap` 再次把混杂灌回 \(h_z\) 路径。
+
+---
+
+## 7. 三者一起建模时的统一框架
 
 可达性、流行度、区域不是三个独立补丁，而是同一生成过程的不同外生/中介变量。一个可操作的统一分数：
 
 \[
 \begin{aligned}
 s(u,p,t)
-&= \underbrace{s_{\theta}(u,p,t)}_{\text{个性化偏好（主模型）}}
+&= \underbrace{s_{\theta}(u,p,t)}_{\text{个性化偏好（主模型 / } h_z\text{）}}
 + \underbrace{\beta_a\, s_{\text{access}}(u,p,t)}_{\text{可达性}}
 + \underbrace{\beta_p(u)\, s_{\text{pop}}(p,t)}_{\text{流行度（用户门控）}}
 + \underbrace{\beta_r\, s_{\text{area}}(a_u,a_p,t)}_{\text{区域转移}}
@@ -249,68 +428,75 @@ s(u,p,t)
 
 训练目标建议：
 
-1. **主损失**：下一 POI CE（可 IPS 加权：距离桶 × 流行度倾向）。
-2. **辅助损失**（GETNext 已有）：时间、类别 —— 类别头有助于兴趣信号，可对类别 CE **提高权重**，对 POI_id 头做去偏，形成“先功能、后具体地点”的两阶段因果直觉。
-3. **去混淆正则**：  
-   - 惩罚 \(s_\theta\) 与 `pop`、与 `dist` 的全局相关（软正交）；或  
-   - adversarial：额外判别器想从 \(s_\theta\) 预测 pop/dist 桶，主模型最大化其损失（需小心伤及有用信息，最好只 adversarial 掉“与 label 无关的部分”）。
-4. **反事实一致性**：对同一历史，扰动 pop/area 编码后，类别预测应更稳，POI_id 预测允许变。
+1. **主损失**：下一 POI CE（条件化 \(C\) 的 deconfounded 形式；必要时再加轻度 IPS）。
+2. **辅助损失**（GETNext 已有）：时间、类别 —— 类别头有助于兴趣信号，可对类别 CE **提高权重**，对 POI_id 头做去偏，形成“先功能、后具体地点”的两阶段因果直觉；类别头也可作为近似前门中介（启发式，非严格识别）。
+3. **表征去混淆正则**：  
+   - \(h_z \perp C\)（对抗 / HSIC / 正交）；\(h_c\) 重构 \(C\)；  
+   - 跨环境 Group DRO / IRM；  
+   - 惩罚 \(s_\theta\) 与 `pop`、`dist` 的全局相关作轻量替代。
+4. **反事实一致性**：对同一历史，扰动 pop/area 编码后，类别预测应更稳，POI_id 预测允许变（对应 `do(C)` 探针）。
 
 推理时可提供两种模式：
 
 - **写实模式**：保留 access/pop/area（贴近真实下一跳，刷线上指标）。
-- **偏好模式**：`β_a, β_p` 缩小或 `do(pop=c)`（更适合“猜兴趣 / 探索推荐”）。
+- **偏好 / 去混淆模式**：边缘化 \(C\) 或 `do(C=\bar{c})`，主要用 \(h_z\)（更适合“猜兴趣 / 探索推荐”）。
 
 这对研究“模型到底学到了什么”很有价值。
 
 ---
 
-## 7. 与 GETNext 模块的具体挂钩清单
+## 8. 与 GETNext 模块的具体挂钩清单
 
 | 模块 | 现状 | 因果向改动 |
 |------|------|------------|
-| `graph_X` / `checkin_cnt` | 直接进 GCN | 拆出为流行度偏置；GCN 更侧重 cat + 去中心化地理/区域特征 |
-| `graph_A` | 原始转移频次 | 距离桶内归一化；`/ pop(j)^α`；或构建 access-conditioned 图 |
-| `NodeAttnMap` | `e * (A+1)` 加强群体流 | 改为偏好注意力 × 结构门控；避免双重计入热门近邻 |
-| `UserEmbeddings` | 单一用户向量 | 拆成兴趣子空间 + 从众/活跃度子空间；后者可与 pop 门控共享 |
-| `TransformerModel` | 三头 POI/time/cat | 强化 cat 头；POI 头用去偏损失；可加 area 条件 |
-| `adjust_pred_prob_by_graph` | 直接加 attn_map | 拆成 access / area / residual-flow 三项可开关 |
-| 评估 | 全局 Acc@k / MRR | 加距离桶、流行度四分位、跨 area、小众用户子集 |
+| `graph_X` / `checkin_cnt` | 直接进 GCN | 拆出为 \(C_{pop}\) / \(h_c\)；GCN 更侧重 cat + 区域特征 |
+| `graph_A` | 原始转移频次 | 距离桶内归一化；`/ pop(j)^α`；残差流进写实支路，不进 \(h_z\) |
+| `NodeAttnMap` | `e * (A+1)` 加强群体流 | 拆成偏好注意力 × 结构门控；或仅加入 factual 路径 |
+| `UserEmbeddings` | 单一用户向量 | 显式 \(h_z\)（兴趣）+ \(h_c\)（从众/活跃/常驻 area） |
+| `TransformerModel` | 三头 POI/time/cat | 条件化 \(C\) 的 POI 头；强化 cat 头；可选后门边缘化推理 |
+| `adjust_pred_prob_by_graph` | 直接加 attn_map | factual / deconfounded 两套聚合；deconf 路径避免再灌热门近邻 |
+| 损失 | CE(+time+cat) | + 对抗去混淆 + Group DRO；IPS 仅作稀有桶辅助 |
+| 评估 | 全局 Acc@k / MRR | 距离桶、流行度四分位、跨 area、小众用户；外加 `do(C)` 排序稳定性 |
 
 ---
 
-## 8. 建议的实验顺序（由易到难）
+## 9. 建议的实验顺序（由易到难）
 
-不必一上来上完整 SCM。建议：
+不必一上来上完整可识别 SCM。建议：
 
 1. **诊断**  
    - 统计训练转移距离分布、命中样本的距离分布、top-k 候选的平均 pop。  
    - `do(pop)` / 去掉 `checkin_cnt` / 去掉 `NodeAttnMap` 的消融，看指标与长尾子集变化。
 
-2. **轻量干预**  
-   - 距离分层 IPS + 流行度降权 CE。  
-   - `A` 的 pop/距离归一化。  
-   - 同距离环带负采样。
+2. **轻量干预（含或不含 IPS）**  
+   - \(A\) 的 pop/距离归一化；同距离环带负采样。  
+   - 可选：距离分层 IPS（裁剪）作基线对照。
 
-3. **结构分解**  
-   - \(s = s_{\text{pref}} + s_{\text{access}} + s_{\text{pop}}(u) + s_{\text{area}}\)。  
+3. **SCM + Deconfounded / 表征方法（主推）**  
+   - 定义 \(C\)，实现 \(h_z/h_c\) 分解 + 对抗或正交约束。  
+   - 条件头 + 推理时后门边缘化 / `do(C=\bar{c})`。  
+   - 按环境做 Group DRO；对比“仅 IPS”与“仅表征去混淆”与“两者结合”。
+
+4. **结构分数分解**  
+   - \(s = s_{\text{pref}}(h_z) + s_{\text{access}} + s_{\text{pop}}(u) + s_{\text{area}}\)。  
    - area 特征与区域流图。
 
-4. **反事实评估协议**  
+5. **反事实评估协议**  
    - 固定报告：整体指标 + 远跳 + 长尾 POI + 跨 area + 低从众用户组。  
-   - 避免只看被近邻/热门刷高的 Acc@1。
+   - 报告 factual vs deconfounded 两套指标，避免只看被近邻/热门刷高的 Acc@1。
 
 ---
 
-## 9. 风险与边界
+## 10. 风险与边界
 
 - **过度去偏**：可达性与流行度在真实世界里*确实*影响下一跳；完全 `do(access=1), do(pop=0)` 的预测会不切实际。要分清任务：是“预测真实下一签到”还是“推断潜在兴趣”。
-- **不可识别性**：没有随机实验或强工具变量时，偏好与居住地/常驻 area 无法完美分开；应用条件化与敏感性分析（改变 β 看排序稳定性）。
-- **方差**：IPS 与长尾上采样可能伤整体 Acc；需用多目标或 Group DRO，保证近邻主群体不明显崩坏。
+- **不可识别性**：没有随机实验或强工具变量时，偏好与居住地/常驻 area 无法完美分开；应用条件化与敏感性分析（改变 β / 边缘化分布看排序稳定性）。因果发现学到的图不宜过度信任。
+- **对抗训练不稳**：\(h_z \perp C\) 过强会伤有用信号；优先 partial disentanglement + 重建 \(C\) 的 \(h_c\) 支路。
+- **方差**：纯 IPS 与长尾上采样可能伤整体 Acc；表征方法相对更稳，仍需 Group DRO / 多目标，保证近邻主群体不明显崩坏。
 - **图泄漏**：`A` 若含验证/测试时段转移，去偏结论会偏乐观；应严格只用训练期构图（当前 `build_graph.py` 流程需保持这一点）。
 
 ---
 
-## 10. 一句话收束
+## 11. 一句话收束
 
-GETNext 很强地拟合了**群体轨迹流 + 序列上下文**，但也因此把**邻近可达、热门曝光、区域土地用途**写进了“偏好”。用因果视角，不是扔掉这些信号，而是把它们从偏好里**显式剥离成可干预项**，让主模型学残差兴趣，并用距离/流行度/跨 area 的切片评估去检验：模型是否还能看见那些“偶尔走远、偏爱小众、跨区行动”的用户。
+GETNext 很强地拟合了**群体轨迹流 + 序列上下文**，但也因此把**邻近可达、热门曝光、区域土地用途**写进了“偏好”。用因果视角，不必停在 IPS：用 **SCM 因果图** 标明混杂路径，再用 **deconfounded training / 表征解耦（\(h_z \perp C\)）/ 跨环境不变** 把偏好与约束拆开，配合切片与 `do(C)` 评估，才能检验模型是否还看得见那些“偶尔走远、偏爱小众、跨区行动”的用户。
