@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 runs/
 .DS_Store
+dataset/NYC/
+dataset/__MACOSX/

@@ -16,9 +16,18 @@ if ! python -c "import torch" >/dev/null 2>&1 || [ ! -f dataset/NYC/NYC_train.cs
   source .venv/bin/activate
 fi
 
-EPOCHS="${EPOCHS:-3}"
+EPOCHS="${EPOCHS:-2}"
 BATCH="${BATCH:-8}"
 NAME="${NAME:-cpu-smoke}"
+# Smaller dims keep CPU smoke tractable on Cloud VMs.
+POI_EMBED_DIM="${POI_EMBED_DIM:-32}"
+USER_EMBED_DIM="${USER_EMBED_DIM:-32}"
+TIME_EMBED_DIM="${TIME_EMBED_DIM:-16}"
+CAT_EMBED_DIM="${CAT_EMBED_DIM:-16}"
+NODE_ATTN_NHID="${NODE_ATTN_NHID:-32}"
+TRANSFORMER_NHID="${TRANSFORMER_NHID:-128}"
+TRANSFORMER_NLAYERS="${TRANSFORMER_NLAYERS:-2}"
+TRANSFORMER_NHEAD="${TRANSFORMER_NHEAD:-2}"
 
 echo "=== GETNext CPU smoke train (${EPOCHS} epochs, batch=${BATCH}) ==="
 python train.py \
@@ -28,14 +37,14 @@ python train.py \
   --data-node-feats dataset/NYC/graph_X.csv \
   --time-units 48 \
   --time-feature norm_in_day_time \
-  --poi-embed-dim 64 \
-  --user-embed-dim 64 \
-  --time-embed-dim 16 \
-  --cat-embed-dim 16 \
-  --node-attn-nhid 64 \
-  --transformer-nhid 256 \
-  --transformer-nlayers 2 \
-  --transformer-nhead 2 \
+  --poi-embed-dim "${POI_EMBED_DIM}" \
+  --user-embed-dim "${USER_EMBED_DIM}" \
+  --time-embed-dim "${TIME_EMBED_DIM}" \
+  --cat-embed-dim "${CAT_EMBED_DIM}" \
+  --node-attn-nhid "${NODE_ATTN_NHID}" \
+  --transformer-nhid "${TRANSFORMER_NHID}" \
+  --transformer-nlayers "${TRANSFORMER_NLAYERS}" \
+  --transformer-nhead "${TRANSFORMER_NHEAD}" \
   --batch "${BATCH}" \
   --epochs "${EPOCHS}" \
   --workers 0 \
