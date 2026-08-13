@@ -1,535 +1,331 @@
-# 在 GETNext 上用因果视角做 Next-POI 预测：思考笔记
+# 从 Transformer 视角做 Next-POI 因果去偏：思考笔记
 
-本文档记录如何在现有 GETNext（Trajectory Flow Map + Transformer）上，用**因果去偏**思路缓解三类系统性偏差：
+本文从 **Transformer / 序列建模** 的通用理念出发，讨论 next-POI 推荐中的因果去偏，而不是绑定某一篇具体模型（如 GETNext）的图模块。
+
+核心立场：
+
+- Next-POI 在多数现代方法里，本质是 **给定历史轨迹，预测下一个离散“词”（POI id）** 的自回归 / encoder 打分问题。
+- **POI embedding 从哪来**（随机初始化查表、预训练、GCN、空间编码器……）只是输入表征的一种实现；因果问题主要出在 **序列目标、注意力聚合、词表 softmax、以及训练数据的生成机制** 上。
+- GETNext 的 GCN / Trajectory Flow Map 只是“给 Transformer 更好的 POI 输入 / 额外先验”的一种特例；下文默认 **不依赖 GCN**，必要时在附录对照。
+
+关注的三类偏差：
 
 1. **可达性 / 距离偏差**（Accessibility / Distance bias）
 2. **流行度偏差**（Popularity bias）
 3. **区域属性混淆**（Area / Land-use confounding）
 
-目标不是另起一套全新模型，而是：**明确“用户偏好”与“环境约束/曝光机制”的因果结构**，再把可落地的干预接到 GETNext 现有模块上（GCN 节点特征、轨迹流图 `A`、`NodeAttnMap`、Transformer logits、训练损失与评估）。
+去偏主路线：**SCM 因果图 → deconfounded training / 表征解耦**；IPS 仅作稀有样本辅助。
 
-去偏路线不限于 IPS：更推荐 **SCM 因果图 → deconfounded training / 表征解耦**（详见 §6）；IPS 可作为稀有样本上的辅助稳定器。
-
-> **公式说明**：正文数学使用 GitHub 友好的 `$...$`（行内）与 `$$...$$`（独立公式）。若本地预览不渲染，请用支持 KaTeX/MathJax 的查看器，或直接在 GitHub 上打开本文件。
+> **公式说明**：使用 GitHub 友好的 `$...$`（行内）与 `$$...$$`（独立公式）。
 
 ---
 
-## 1. 问题从哪里来：观测数据 ≠ 用户偏好
+## 1. Transformer 式 Next-POI：在优化什么？
 
-Next-POI 训练数据是**观测到的 check-in**，不是“用户在无约束下自由选择”的结果。一次签到大致可写成：
+把一条轨迹写成 token 序列：
 
+$$
+H=(p_1,t_1,c_1),\ldots,(p_T,t_T,c_T)
+$$
+
+典型 Transformer next-POI 管线（抽象）：
+
+```text
+POI / user / time / category id
+        │
+        ▼
+   Embedding 层   ←── 任意实现：nn.Embedding / 预训练 / GCN / 空间编码 …
+        │
+        ▼
+  融合为序列 token x_1..x_T
+        │
+        ▼
+ Transformer Encoder（因果 mask 或只取最后位置）
+        │
+        ▼
+     h_T（上下文表征）
+        │
+        ▼
+  打分 s(h_T, p) 对词表 Softmax → P(p_{T+1} | H)
+```
+
+训练目标几乎总是：
+
+$$
+\max_\theta\; \log P_\theta(p_{T+1}\mid H)
+\quad\text{即 CrossEntropy over POI vocabulary}
+$$
+
+这与语言模型相同：**观测到的下一 token 被当成“正确标签”**。但 check-in 不是自由写作，而是
 
 $$
 \mathrm{Visit}(u,p,t)=f\big(\mathrm{Pref}(u,p),\;\mathrm{Access}(u,p,t),\;\mathrm{Expo}(p,t),\;\mathrm{Area}(p),\;\mathrm{Context}(t)\big)+\epsilon
 $$
 
+因此 CE 会把 Access / Expo / Area **一并写进**：
 
-其中各项含义：
+| 位置 | 学到的“捷径” |
+|------|----------------|
+| Token embedding | 热门 POI 范数更大、更新更频；地理邻近的 id 在共现中被拉近 |
+| Self-attention | 更关注“最近一次附近 POI”、重复访问的热门点 |
+| 输出层 / 偏置 | 对高频 POI_id 给出更高先验 logits（类似 LM 的 unigram bias） |
+| Softmax 竞争 | 长尾兴趣在近邻×热门候选面前被压掉 |
 
-- $\mathrm{Pref}(u,p)$：想去（用户偏好）
-- $\mathrm{Access}(u,p,t)$：能不能去（可达性）
-- $\mathrm{Expo}(p,t)$：被曝光到（流行度/曝光）
-- $\mathrm{Area}(p),\mathrm{Context}(t)$：场景（区域与上下文）
-
-标准 MLE / CrossEntropy 直接拟合 $P(Y\mid H)$（下一 POI | 历史），会把 **Access / Expo / Area** 的效应一并学进“用户偏好”和“POI 表征”里。于是：
-
-| 现象 | 数据侧机制 | 模型侧表现（GETNext） |
-|------|------------|------------------------|
-| 近距离主导 | 多数转移发生在短距离；远距离访问稀疏 | GCN/`NodeAttnMap` 被高频近邻边主导；Transformer 也学到“靠近当前点就高分” |
-| 热门主导 | `checkin_cnt` 高的 POI 在图与序列中反复出现 | 节点特征含 `checkin_cnt`；解码器偏向热门 logits |
-| 区域模式主导 | 商圈/居民区决定“白天去哪、晚上回哪” | 经纬度+类别被当成偏好，实则是土地用途与作息的混杂 |
-
-对**偶尔远行**、**反潮流个人兴趣**、**跨区非常规转移**的用户，整体 Acc@k 可能仍好看，但这类长尾样本几乎被忽略。
+**结论：** 就算完全去掉 GCN，只要仍用“历史 → Transformer → 全词表 CE”，距离/流行度/区域偏差依然存在。图模块可能放大它们，但不是根因。
 
 ---
 
-## 2. 对齐 GETNext 的因果图（Conceptual SCM）
-
-把当前管线拆成可干预的变量会更清晰：
+## 2. 通用因果图（与具体 POI encoder 解耦）
 
 ```text
-                    ┌──────────────┐
-   Area(p) ────────►│  Access(u,p,t) │◄──── Distance / 交通 / 时间窗
-                    └──────┬───────┘
-                           │
- Popularity(p) ──► Expo(p)─┼──────────────► Observed Transition / Check-in
-                           │                        │
- User Pref(u,·) ───────────┘                        ▼
-                                           Trajectory Flow Map A
-                                           Node feats X (含 checkin_cnt, lat/lon, cat)
-                                                    │
-                              ┌─────────────────────┼─────────────────────┐
-                              ▼                     ▼                     ▼
-                            GCN               NodeAttnMap            Transformer
-                              └──────────► fused seq embed ──────────────┘
-                                                    │
-                                                    ▼
-                                      y_pred = Transformer + attn_map[cur]
+   Z (user interest)          C_pop (popularity / exposure)
+            │                         │
+            │         ┌───────────────┤
+            ▼         ▼               ▼
+ H (history) ──► h = Transformer(H) ──► Y (next POI)
+            ▲         ▲               ▲
+            │         │               │
+       C_area    C_access ◄── dist, time budget, mobility
+     (land-use)       ▲
+                      │
+                 home/work anchors, Area
 ```
 
-要点：
+| 符号 | 含义 | Transformer 管线中的落点 |
+|------|------|---------------------------|
+| $Z$ | 相对稳定的兴趣 | 用户向量兴趣子空间；attention 聚合出的兴趣成分 |
+| $C=\{C_{\mathrm{access}},C_{\mathrm{pop}},C_{\mathrm{area}}\}$ | 混杂 / 场景约束 | 不必进“兴趣表征”；应显式条件化或走独立支路 |
+| $h$ | 序列上下文向量 | Transformer 最后位置（或池化）输出 |
+| $Y$ | 下一 POI（或下一类别） | 词表上的 CE / 多任务头 |
 
-- **想估计的因果量**：在给定历史与当前上下文下，用户对候选 POI 的**偏好效应** $P(\mathrm{visit} \mid do(Pref),\; context)$，或至少分离出“偏好驱动的分数”。
-- **不该直接当偏好的量**：全局转移频次 `A`、节点 `checkin_cnt`、纯地理邻近、区域土地用途带来的“必经/常驻”模式。
-- GETNext 的 `adjust_pred_prob_by_graph`（`attn_map[cur] + transformer_logits`）本质上是把**群体流动先验**硬加进预测；若 `A` 与近邻/热门高度相关，偏差会被**放大二次**（图侧一次 + logits 侧一次）。
+想估计的量往往不是裸的 $P(Y\mid H)$，而是：
+
+$$
+P(Y\mid h_z,\; do(C=\bar{c}))
+\quad\text{或}\quad
+\sum_c P(Y\mid h_z,c)\,P(c)
+$$
+
+即：让 Transformer 学的主表征尽量接近偏好 $Z$，再对混杂 $C$ 做干预或边缘化。
+
+POI embedding 来源（查表 / GCN / …）只影响 $H$ 如何被数值化，**不改变这张因果图的主干**。
 
 ---
 
-## 3. 可达性（Accessibility）：邻近不等于偏好
+## 3. 从 Transformer 机制看三类偏差
 
-### 3.1 因果表述
+### 3.1 可达性：邻近被注意力当成“语义相关”
 
-- **混杂 / 中介**：距离既限制可达性，又与居住地、工作地相关，从而与“真偏好”相关。
-- **选择偏差**：远距离正样本极少 → 模型把“远 = 低分”当成稳定规律。
-- **想要的反事实**：若把候选 $p$ 的可达性提升到与近邻相当（$do(\mathrm{Access}=1)$），用户是否仍会选它？若会，说明存在真实兴趣，而不只是“碰巧近”。
+**现象：** 训练转移大量短距 → 模型发现“复制/偏向当前点附近 id”损失最低。
 
-### 3.2 可落地思路（由浅到深）
+在 Transformer 里这表现为：
 
-#### A. 显式可达性因子 + 残差偏好（推荐优先试）
+1. **位置捷径**：因果注意力过度依赖最后几个 token（recency + proximity 耦合）。
+2. **共现几何**：embedding 空间里，常一起出现的近邻 POI 聚成一团；点积打分等价于“近邻检索”。
+3. **负采样/全词表 CE**：远距离正样本稀少，梯度几乎不要求模型区分“同距离环带内谁更符合兴趣”。
 
-把下一 POI 分数拆成：
+**去偏（不靠 GCN）：**
 
-
-$$
-s(u,p,t) = s_{\mathrm{pref}}(u,p,t) + \lambda(t)\, s_{\mathrm{access}}(u,p,t)
-$$
-
-
-- $s_{\mathrm{access}}$：由距离、时间预算、历史活动半径、区域连通性等**非学习或弱学习**的项给出（可微或后处理均可）。
-- $s_{\mathrm{pref}}$：才是 Transformer / 用户嵌入要学的部分。
-- 训练时可用 **backdoor / residual learning**：先拟合或固定 access 项，再让主模型拟合残差标签分布；或对 access 项 stop-grad，避免主网偷懒全靠距离。
-
-接到 GETNext：
-
-- 不要让 `NodeAttnMap` 无约束地吸收全部地理邻近；可对 `A` 做**距离归一化边权**（同距离桶内再比转移强度），或把 `e_ij * A_ij` 改成 `e_ij * g(A_ij / f(dist_ij))`。
-- 解码时：`y = s_pref + α * s_graph + β * s_access`，并对 α、β 做消融，观察远距离命中是否上升。
-
-#### B. 距离分层 / Inverse Propensity on Distance
-
-把每次转移按距离分桶（如 0–0.5km / 0.5–2km / 2–5km / >5km），估计“出现在该桶的倾向” $\pi(d)$，训练权重：
-
+- 分数分解：
 
 $$
-w = \frac{1}{\pi(d)^\gamma}
+s(u,p,t)=s_{\mathrm{pref}}(h_z,p)+\lambda(t)\,s_{\mathrm{access}}(u,p,t)
 $$
 
+  其中 $s_{\mathrm{access}}$ 由距离、活动半径、时间预算等给出；$s_{\mathrm{pref}}$ 才是 Transformer 主头。
 
-远距离样本上权，迫使模型在稀有远跳上也产生梯度。这是对 **selection into nearby transitions** 的近似 IPS。
+- **同距离环带负采样 / 对比学习**：逼迫 attention+输出层在“一样近”的集合里学偏好。
+- **距离桶 IPS**（可选）：稀有远跳上权，方差需裁剪。
+- **评估切片**：Acc@k 按距离桶；否则近邻样本淹没一切。
 
-注意：IPS 方差大，需裁剪 $w$、或用自归一化 IPS；并按用户或轨迹做分层，避免被少数极端远跳主导。
+反事实问题：若 $do(\mathrm{Access}=1)$（候选同样可达），排序是否仍指向同一 POI？这才接近“想去”。
 
-#### C. 反事实数据增强（Counterfactual augmentation）
+### 3.2 流行度：词表频率先验钻进 Softmax
 
-在保持类别/用户偏好信号的前提下，构造“若用户当时在另一位置”的轨迹：
+**现象：** 热门 POI 在序列中出现多 → embedding 与输出偏置被更多更新 → 类似语言模型 unigram。
 
-- **空间平移 / 镜像**：把一段轨迹整体平移到另一区域，标签随 POI 映射到同类别、相似功能的候选（难，需 POI 对齐）。
-- 更现实的变体：**硬负样本挖掘**——对每个正样本，采样同距离环带内的其他 POI 作强负例，让模型在“一样近”的集合里学偏好，而不是学“近 vs 远”。
+在 Transformer 里：
 
-同距离环带内对比学习，往往比盲目远距离上采样更稳。
+1. 输出层权重 / 偏置隐式学到 $P(p)$。
+2. 用户向量容易塌成“跟热门对齐”，对小众兴趣用户失效。
+3. Multi-head 可能用若干头专门“复读高频模式”，而非建模个人转移语法。
 
-#### D. 评估必须切开距离
+**去偏（表示层，而非改图）：**
 
-整体 Acc@k 会被近邻样本淹没。至少报告：
+- 两头打分：
 
-- Acc@k（按距离桶分层）
-- 远距离召回 / 远距离 nDCG
-- “下一跳超出用户历史 P95 半径”子集上的指标
+$$
+s(u,p)=s_{\mathrm{match}}(h_z,p)+g(u)\,\mathrm{pop}(p)
+$$
 
-否则任何去偏是否有效都看不出来。
+  推理可关 $g$（偏好模式）或保留 $g$（写实模式）。
+
+- 对 CE 做流行度倾向加权，或 popularity-aware 负采样的逆操作。
+- **表征去混淆**：$h_z \perp C_{\mathrm{pop}}$（对抗 / 正交），流行度只进 $h_c$ 或 $g(\cdot)$。
+- 辅助 **类别头**：兴趣对“咖啡 vs 酒吧”更稳，对“哪家网红店”更易受流行度污染；强化 category CE 有助于 $h_z$。
+
+### 3.3 Area：场景切换被误学成兴趣切换
+
+商圈午餐 vs 居民区晚间，是 **条件机制不同**，不是偏好向量整体翻转。
+
+Transformer 视角：
+
+- 若不告诉模型 area，它会用 lat/lon、最近 POI 类别统计去隐式拟合区域——这些信号与 $Z$ 纠缠在 $h$ 里。
+- Self-attention 的“上下文”其实常是 **当前 area 的局部模式**，跨区远跳被当成异常。
+
+**做法：**
+
+- 显式 $C_{\mathrm{area}}$（网格 / 功能区 / 家公司锚点）。
+- 条件化预测 $P(Y\mid h_z, a_{\mathrm{from}}, t)$，或加 $s_{\mathrm{area}}(a\to a_p)$ 支路。
+- 跨 area 子集单独评估。
 
 ---
 
-## 4. 流行度（Popularity）：热门曝光 ≠ 个人兴趣
+## 4. 契合 Transformer 理念的去偏训练（相对 IPS 更主推）
 
-### 4.1 因果表述
+IPS 改的是样本权重；Transformer 更需要对齐其归纳偏置：**表征 $h$、注意力、词表打分头**。
 
-- **曝光机制**：越热门越容易出现在别人的轨迹里 → 进入全局图 `A` 与节点特征 `checkin_cnt` → GCN/`NodeAttnMap` 对热门节点给出更高结构分。
-- **反馈回路**：模型再推荐热门 → 若用于在线系统会加剧马太效应（离线训练里则是拟合历史马太效应）。
-- **异质性**：对“从众型”用户，流行度是有效信号；对“小众兴趣型”用户，流行度是有害混杂。需要的是 **条件效应**，而不是全局减流行度。
-
-### 4.2 可落地思路
-
-#### A. 两塔 / 两头分解：匹配分 + 流行度分
-
+### 4.1 双表征 + 后门调整
 
 $$
-s(u,p) = s_{\mathrm{match}}(u,p) + g(\mathrm{pop}(p),\, u)
+h \xrightarrow{\mathrm{split}} (h_z, h_c),\quad
+C=[\mathrm{dist\_bucket},\,\log\mathrm{pop},\,\mathrm{area},\,\mathrm{hour}]
 $$
 
+- 训练：$P(Y\mid h_z,h_c)$ 或 $P(Y\mid h_z,c)$  
+- 约束：$h_z$ 难预测 $C$；$h_c$ 要能预测 $C$  
+- 推理：  
+  - **写实**：用真实 $c$ / $h_c$  
+  - **去混淆**：$\sum_{c'} P(Y\mid h_z,c')\hat{P}(c')$ 或 $do(C=\bar{c})$
 
-- $s_{\mathrm{match}}$：用户–POI 个性化匹配（应用户兴趣）。
-- $g$：可学习的、依赖用户类型的流行度门控（对部分用户 $g$ 大，对小众用户 $g$ 接近 0）。
+这直接对应 Transformer 的“上下文向量该编码什么”。
 
-GETNext 中：
+### 4.2 跨环境不变（IRM / Group DRO）
 
-- 节点特征里的 `checkin_cnt` 建议：**标准化 / log1p 后单独通道**，或从 GCN 输入中移出，改为解码期加性偏置，便于做因果消融（`do(pop=0)` ≈ 去掉该偏置看排序变化）。
-- `NodeAttnMap` 用的 `A` 含转移频次，天然偏热门；可对行做 **流行度折减**：$A'_{ij} = A_{ij} / \mathrm{pop}(j)^\alpha$，再进入注意力调制。
-
-#### B. 倾向评分（Propensity）加权损失
-
-令 $\pi(p) \approx P(\mathrm{exposed} \mid p) \propto \mathrm{pop}(p)$（或用更细的 user–POI 倾向模型），对 CE 做：
-
+把距离×流行度×area 切片当环境 $e$，要求同一 $h_z$ 在多环境下都能预测 $Y$（或类别）：
 
 $$
-\mathcal{L} = \sum -\frac{1}{\pi(p^+)^\gamma}\log \frac{e^{s_{p^+}}}{\sum_q e^{s_q}}
+\min_\theta \sum_e \mathcal{L}_e(\theta)+\lambda\cdot\mathrm{Penalty}(\{\nabla_{w\mid e}\})
 $$
 
+符合 Transformer 想学的“可迁移序列规律”，而不是单环境捷径。
 
-也可只在负采样分布上做 **popularity-aware negative sampling 的逆操作**：负样本按热门过度采样，正样本按热门降权，迫使 match 头区分“热但我不喜欢”。
+### 4.3 对抗解耦 / partial disentanglement
 
-#### C. 因果表示：不变偏好子空间
+完全 $h\perp C$ 过强（兴趣与常驻 area 相关）。更稳：
 
-用环境划分做不变学习（Invariant Risk Minimization / Group DRO 的简化版）：
+- 只对 $h_z$ 去 $C$  
+- $h_c$ 吃混杂并进入 access/pop/area 支路  
+- 偏好模式推理只用 $h_z$
 
-- 环境例子：工作日 vs 周末、高流行度时段 vs 低、不同 borough。
-- 要求用户嵌入中的“兴趣子空间”在多环境下都能预测下一 **类别** 或下一 **功能型 POI**，而对绝对 POI_id 的依赖可环境变化。
+### 4.4 与“语言模型式”技巧的类比
 
-直觉：个人兴趣对“咖啡 vs 酒吧”相对稳定；对“哪家网红店”随流行度环境变化。多环境一致性惩罚有助于剥离流行度。
+| LM / Transformer NLP | Next-POI 对应 |
+|----------------------|---------------|
+| 频率偏置 / unigram | POI 流行度头，可开关 |
+| 领域自适应 / 不变表示 | 跨 area、跨距离桶的 $h_z$ |
+| 控制生成（steer by attribute） | `do(C)` 改写混杂后再打分 |
+| 对比学习 / hard negatives | 同距离环带、同 area 内难负例 |
+| 多任务（句法 vs 语义） | 类别/时间头 vs POI_id 头 |
 
-#### D. 反事实推理问题（用于分析与 re-ranking）
-
-对同一用户历史，问：
-
-- 若将候选集中所有 POI 的流行度设为同一常数，排序如何变？
-- 哪些用户的 top-k 几乎不变（兴趣主导）？哪些剧烈变成长尾（说明原模型在吃流行度）？
-
-这类 `do(pop)` 探针不改训练也能诊断；再决定是否加门控或 IPS。
+不必引入 GCN，也能把因果干预做进 **encoder 输出与解码打分**。
 
 ---
 
-## 5. 区域属性（Area）：商圈 vs 居民区等
-
-### 5.1 为什么要单独建区
-
-距离与流行度都还不够：
-
-- 同样 1km，从居民区到地铁站 vs 从商圈到另一商圈，语义完全不同。
-- “回家”“去上班”“周末逛街”是 **area-conditioned** 的转移模式，不是单纯 POI 偏好。
-- 若不建模 area，GCN 会用 lat/lon 隐式拟合区域簇，但无法区分“区域约束”与“兴趣”。
-
-### 5.2 Area 变量怎么定义（数据侧）
-
-在 NYC 上可从粗到细：
-
-1. **网格 / geohash / census tract**（纯空间分区）
-2. **功能区标签**（residential / commercial / nightlife / transit hub…）  
-   - 可用 POI 类别聚合：某格子内 Food/Shop/Office/Home-related 的比例 → soft land-use 向量
-3. **用户个人锚点**：家/公司的推断（夜间众数格子、工作日白天众数格子）
-
-建议把 area 做成：
-
-- POI 的 `area_id` / `area_feat`
-- 转移的 `area_i → area_j` 边（区域流图），与 POI 流图 `A` 分层
-
-### 5.3 因果角色
-
-Area 常常是 **混杂因子** 或 **效应修饰因子（moderator）**：
-
-- 混杂：住在商圈附近的人更常打卡热门店 → 看起来像“喜欢热门”，其实是居住 area 的效应。
-- 修饰：同一用户在“工作区午餐时间”与“居住区晚间”的偏好机制不同 → 应估计条件效应 $Pref(u,p \mid area, t)$。
-
-对应干预：
-
-- 控制 area：在同一 `(from_area, time_bin)` 内比较候选 POI（分层或条件建模）。
-- 跨 area 的远跳：单独评估，避免被区内短跳指标掩盖。
-
-### 5.4 接到 GETNext 的结构想法
-
-1. **分层图**  
-   - POI 层：现有 trajectory flow map  
-   - Area 层：area 转移图 + area 嵌入  
-   - 消息传递：POI embed ← 自身 + 所属 area embed；`NodeAttnMap` 增加 area 兼容项（跨区惩罚或跨区门控，而非一刀切禁止）
-
-2. **解码分解**  
-   
+## 5. 统一分数（仍是 Transformer 解码，而非图扩散）
 
 $$
-s(p) = s_{\mathrm{poi\_pref}} + s_{\mathrm{area\_transit}}(a_{\mathrm{cur}}\!\to\! a_p) + s_{\mathrm{access}} + s_{\mathrm{pop}}
+s(u,p,t)=s_{\theta}(h_z,p)+\beta_a\,s_{\mathrm{access}}+\beta_p(u)\,s_{\mathrm{pop}}+\beta_r\,s_{\mathrm{area}}
 $$
 
+- $s_{\theta}$：Transformer 主匹配分（点积 / MLP / tied embedding）  
+- 后三项：显式混杂支路，**不要偷塞回无名 $h$**
 
-   Transformer 主学 `s_poi-pref`；area-transit 可用小参数表或第二套轻量 GCN。
+训练建议：
 
-3. **条件归一化**  
-   在 `(user, from_area, hour)` 条件下对候选做 softmax，相当于在同一场景内排序，削弱“永远推荐大商圈”的全局偏置。
+1. 主 CE：条件化 $C$ 的 deconfounded 形式  
+2. 辅助：时间 + 类别（类别更贴 $Z$）  
+3. 正则：$h_z\perp C$ + Group DRO  
+4. 可选：稀有距离桶裁剪 IPS  
+
+推理双模式：写实（保留 $\beta$）vs 偏好/去混淆（边缘化或冻结 $C$）。
 
 ---
 
-## 6. 不止 IPS：SCM 因果图 + Deconfounded Training + 表征因果
-
-**可以，而且往往比纯 IPS 更适合 GETNext。**
-
-IPS 把偏差当成“采样权重”问题：纠正 $P(\mathrm{observe})$ 与目标分布的差异。但 Next-POI 里，距离 / 流行度 / area 不只是采样偏差，它们是**进入数据生成过程的结构化混杂（或中介）**。此时更自然的路线是：
-
-1. 画 **SCM / 因果图**，标明 $U$（偏好）、$C$（混杂：access/pop/area）、$X$（观测历史与图特征）、$Y$（下一 POI）；
-2. 用后门/前门/干预公式确定**可识别的去混淆目标**；
-3. 用 **deconfounded training** 或 **representation-based** 方法，让编码器学到对 $C$ 去混淆（或与 $C$ 解耦）的表征，再接到 GETNext 的预测头。
-
-IPS 与这类方法**互补**：IPS 改损失权重；SCM/表征方法改**学什么表示、在什么条件分布下预测**。可以只做后者，也可以表征去混淆 + 轻度 IPS。
-
-### 6.1 先把因果图写清楚（推荐的最小 SCM）
-
-把一次“历史 → 下一 POI”写成：
+## 6. 最小实现草图（纯序列，无 GCN 假设）
 
 ```text
-         Z (user latent interest)          C_pop (POI popularity)
-                  │                              │
-                  │         ┌────────────────────┤
-                  ▼         ▼                    ▼
-   H (history) ──► X_pref ──► Y (next POI) ◄── X_ctx
-                  ▲         ▲                    ▲
-                  │         │                    │
-            C_area         C_access ◄── Dist, time budget
-         (land-use)              ▲
-                                 │
-                            Area, home/work anchors
+输入: 历史 POI/time/cat/user + 可算的 C 特征
+Enc:  Embedding + Transformer → h
+Split: h → h_z, h_c
+Loss:  CE(Y | h_z, h_c)
+     + λ1 * Adv(C | h_z)      # 最小化 C 可预测性
+     + λ2 * Pred(C | h_c)
+     + λ3 * GroupDRO(env)
+解码:  s = Dot(h_z, e_p) + g_access + g_pop + g_area
+推理_deconf:  用 c̄ 或边缘化 C；可关掉 g_pop / 缩小 g_access
+推理_factual: 用真实 C
 ```
 
-约定：
-
-| 符号 | 含义 | GETNext 里大致对应 |
-|------|------|-------------------|
-| $Z$ | 用户稳定兴趣（想估计的因果因子） | `UserEmbeddings` 的兴趣子空间 + 序列里与 cat 相关的部分 |
-| $C = \{C_{\mathrm{access}}, C_{\mathrm{pop}}, C_{\mathrm{area}}\}$ | 混杂 / 场景约束 | 距离与活动半径；`checkin_cnt` / 边权；区域标签 |
-| $X$ | 编码器输入 | 轨迹 POI/time/cat 嵌入、GCN(`X`,`A`)、`NodeAttnMap` |
-| $Y$ | 下一 POI（或下一类别） | `decoder_poi` / `decoder_cat` |
-
-**识别问题（要预测的量）：**
-
-- 若任务是“真实下一跳”：估计 $P(Y \mid H)$ 即可，但内部仍应用 SCM 避免把 $C$ 误当成 $Z$ 的全部内容（否则长尾用户差）。
-- 若任务是“偏好驱动的下一跳 / 去混淆推荐”：更关心  
-  
-
-$$
-P(Y \mid do(Z),\; H_{\mathrm{wo}\,C}) \quad\mathrm{or}\quad P(Y \mid X_{\mathrm{pref}},\; do(C=\bar{c}))
-$$
-
-
-  即阻断 $C \to Y$ 的后门路径后，看偏好表征还能不能预测。
-
-后门调整的离散版（$C$ 可分层时）：
-
-
-$$
-P(Y \mid do(X_{\mathrm{pref}})) = \sum_c P(Y \mid X_{\mathrm{pref}}, c)\, P(c)
-$$
-
-
-这就是许多 **deconfounded recommender** 的公式原型：不是按 $P(c \mid X)$ 加权（那会保留混杂），而是按**边缘** $P(c)$（或干预分布）积分。
-
-### 6.2 Deconfounded Training：在 GETNext 上怎么做
-
-核心思想：**训练时显式条件化混杂 $C$，预测/推理时对 $C$ 做边缘化或干预**，使主表征无法走“偷懒走 $C$”的捷径。
-
-#### 方案 A：后门调整头（Backdoor-adjusted prediction）
-
-1. 为每个训练样本构造混杂向量 $c$：距离桶、`log pop(p)`、`area_id`（from/to）、时段等。
-2. 预测头改为条件头：$P(Y \mid h, c)$，其中 $h$ 是 Transformer 输出的轨迹表征。
-3. 推理时：
-   - **写实**：代入真实 $c$；
-   - **去混淆**：  
-     
-
-$$
-P(Y \mid h) = \sum_{c'} P(Y \mid h, c')\, \hat{P}(c')
-$$
-
-
-     或取均匀 / 反事实 $c'=\bar{c}$（如所有候选同一 pop、同一距离环带中位数）。
-
-接到现有代码：不必重写整网。可在 `y_pred_poi` 上增加一项 `f(c)` 的条件偏置，或对 decoder 做 FiLM/拼接 $c$；去混淆推理时对 $c$ 的若干原型做平均。
-
-#### 方案 B：混杂条件化 + 不变风险（Deconfounded + IRM / Group DRO）
-
-把 $C$ 的不同取值看作**环境** $e$（近 vs 远、热门 vs 长尾、商圈 vs 居民区）：
-
-
-$$
-\min_\theta \sum_e \mathcal{L}_e(\theta) + \lambda \cdot \mathrm{Penalty}(\{\nabla_{w\mid e}\})
-$$
-
-
-要求同一套偏好表征在多环境下都能预测 $Y$（或下一类别）。这直接针对“模型只在近邻/热门环境好用”的问题。
-
-GETNext 落地：按距离桶 × 流行度四分位 分组算 CE，再加 Group DRO 或 IRMv1 惩罚；类别头作不变预测目标往往比 POI_id 更稳。
-
-#### 方案 C：对抗 / 互信息去混淆（Adversarial deconfounding）
-
-编码器出 $h = \mathrm{Enc}(H)$，额外判别器 $D$ 试图从 $h$ 预测 $C$（距离桶、pop 桶、area）：
-
-
-$$
-\min_{\mathrm{Enc},\,\mathrm{Pred}}\; \max_D\; \mathcal{L}_{Y}(h) - \lambda\, \mathcal{L}_{C}(D(h))
-$$
-
-
-迫使 $h$ 对 $C$ 信息最少（近似 $h \perp C$），再由单独的 $g(C)$ 支路提供可达性/流行度分数（见 §7 的分数分解）。  
-这就是典型的 **representation-based causal** 做法：把“偏好表征”和“混杂表征”拆开。
-
-注意：完全 $h \perp C$ 可能过强——兴趣本身与常驻 area 相关。更稳妥的是 **partial disentanglement**：
-
-- $h = [h_z ; h_c]$，只对 $h_z$ 做对抗去 $C$；
-- $h_c$ 允许预测 $C$，并单独进入 access/pop/area 支路；
-- 预测 $Y$ 时写实模式用两者，偏好模式只用 $h_z$。
-
-#### 方案 D：结构化因果表征（SCM-shaped encoders）
-
-不只“去相关”，而是按 SCM 搭模块，使干预有明确旋钮：
-
-```text
-H ──► Enc_Z ──► h_z ──┐
-                       ├──► Pred_Y
-C ──► Enc_C ──► h_c ──┘
-         │
-         └──► (optional) recon C / predict dist, pop, area
-```
-
-- 训练：`L_Y(h_z, h_c) + L_recon(C) + L_ortho(h_z, h_c) + L_inv(h_z across env)`  
-- 干预：`do(C=c*)` = 把 `h_c` 换成编码 `c*` 的向量，保持 `h_z` 不变，看 top-k 如何变。  
-这比 IPS 更可解释，也更适合回答“若可达性相同，用户还会去吗？”
-
-### 6.3 常见表征因果算法族，哪些能用
-
-| 算法族 | 想法 | 是否适合 Next-POI / GETNext | 备注 |
-|--------|------|------------------------------|------|
-| Backdoor adjustment / PDA 类 | $\sum_c P(Y\mid X,c)P(c)$ | ✅ 很适合 | pop/距离/area 可离散分层；推理可边缘化 |
-| DecConfounder / 替代混杂因子 | 用多因多果学替代混杂 $\hat{C}$ | ⚠️ 可试 | 需多个“因果”侧变量；POI 图上可把多用户转移当多因 |
-| Disentangled / adversarial rep | $h_z \perp C$，$h_c$ 吃混杂 | ✅ 推荐 | 与 User/POI 双塔或双头天然兼容 |
-| IRM / V-REx / Group DRO | 跨环境不变预测 | ✅ 推荐 | 环境=距离×pop×area 切片 |
-| Front-door | 经中介 $M$ 识别 | ⚠️ 条件苛刻 | 若用“意图类别”作 $M$，需假设类别挡住全部偏好→POI 路径且无 $C\to M$ 后门——很难严格成立，可作启发（先预测 cat 再 POI） |
-| Causal discovery（从数据学图） | 学 DAG 再建模型 | ❌ 优先级低 | 轨迹+强选择偏差下图难可靠；**专家因果图 + 敏感分析**更务实 |
-| IPS / SNIPS | 按倾向重加权 | ✅ 可作辅助 | 方差大；作表征方法的补充而非唯一手段 |
-| Counterfactual data augmentation | 干预 $C$ 后合成样本 | ✅ | 同距离环带替换、同 area 替换热门 POI 等 |
-
-**结论：**  
-用 **SCM 建模 + deconfounded training（后门调整 / 对抗解耦 / 跨环境不变）** 完全可行，且比“只上 IPS”更贴合“邻近与热门被学成偏好”的机制。IPS 保留为对极端稀有桶的稳定器即可。
-
-### 6.4 相对纯 IPS 的优劣
-
-| | IPS | SCM + Deconfounded / Rep-based |
-|--|-----|--------------------------------|
-| 建模对象 | 采样概率 | 数据生成与混杂路径 |
-| 方差 | 易爆，需裁剪 | 通常更稳，但对抗训练可能不稳 |
-| 可解释干预 | 弱 | 强（`do(C)` 有明确模块） |
-| 实现成本 | 低 | 中（要定义 $C$、改头/损失） |
-| 与 GETNext | 改 CE 权重即可 | 改表征与 `adjust_pred_prob_by_graph` 的信息来源 |
-
-推荐默认组合：
-
-1. **主路径**：双表征 $h_z, h_c$ + 后门调整或写实/偏好双模式推理；  
-2. **正则**：跨环境 Group DRO（或轻量 IRM）；  
-3. **可选**：对最稀有距离桶加裁剪 IPS。
-
-### 6.5 最小可跑通的实现草图（仍挂在 GETNext 上）
-
-```text
-现有:  GCN(X,A) → poi_emb
-       Transformer(seq) → h
-       y = decoder(h) + NodeAttnMap(cur)
-
-改为:
-       C = [dist_bucket, log_pop, area_from, area_to, hour]
-       h → split/project → h_z, h_c
-       L = CE(y | h_z, h_c)
-         + λ1 * CE_adv(C | h_z)     # 上升沿训练 Enc，使 h_z 难测 C
-         + λ2 * CE(C | h_c)         # h_c 要能预测混杂
-         + λ3 * GroupDRO(CE by env)
-       推理_deconf: y ∝ softmax(decoder(h_z, c̄) + α * flow_residual)
-       推理_factual: y ∝ softmax(decoder(h_z, h_c) + attn_map)
-```
-
-其中 `flow_residual` 建议是对 `A` 做过 pop/距离归一化后的残差流，避免 `NodeAttnMap` 再次把混杂灌回 $h_z$ 路径。
+POI 向量 $e_p$ 可以是 `nn.Embedding`；若某系统用 GCN 生成 $e_p$，只需保证 **流行度与原始转移频次不要二次灌进 $h_z$**（见附录）。
 
 ---
 
-## 7. 三者一起建模时的统一框架
+## 7. 评估协议（与 backbone 无关）
 
-可达性、流行度、区域不是三个独立补丁，而是同一生成过程的不同外生/中介变量。一个可操作的统一分数：
+只报整体 Acc@k / MRR 会被近邻×热门刷高。固定报告：
 
-
-$$
-s(u,p,t)=s_{\theta}(u,p,t)+\beta_a\,s_{\mathrm{access}}(u,p,t)+\beta_p(u)\,s_{\mathrm{pop}}(p,t)+\beta_r\,s_{\mathrm{area}}(a_u,a_p,t)
-$$
-
-
-其中：
-
-- $s_{\theta}(u,p,t)$：个性化偏好（主模型 / $h_z$）
-- $s_{\mathrm{access}}$：可达性
-- $s_{\mathrm{pop}}$：流行度（可对用户门控）
-- $s_{\mathrm{area}}$：区域转移
-
-训练目标建议：
-
-1. **主损失**：下一 POI CE（条件化 $C$ 的 deconfounded 形式；必要时再加轻度 IPS）。
-2. **辅助损失**（GETNext 已有）：时间、类别 —— 类别头有助于兴趣信号，可对类别 CE **提高权重**，对 POI_id 头做去偏，形成“先功能、后具体地点”的两阶段因果直觉；类别头也可作为近似前门中介（启发式，非严格识别）。
-3. **表征去混淆正则**：  
-   - $h_z \perp C$（对抗 / HSIC / 正交）；$h_c$ 重构 $C$；  
-   - 跨环境 Group DRO / IRM；  
-   - 惩罚 $s_\theta$ 与 `pop`、`dist` 的全局相关作轻量替代。
-4. **反事实一致性**：对同一历史，扰动 pop/area 编码后，类别预测应更稳，POI_id 预测允许变（对应 `do(C)` 探针）。
-
-推理时可提供两种模式：
-
-- **写实模式**：保留 access/pop/area（贴近真实下一跳，刷线上指标）。
-- **偏好 / 去混淆模式**：边缘化 $C$ 或 `do(C=\bar{c})`，主要用 $h_z$（更适合“猜兴趣 / 探索推荐”）。
-
-这对研究“模型到底学到了什么”很有价值。
+- 距离桶 Acc@k / 远跳召回  
+- 流行度四分位、长尾 POI  
+- 跨 area 转移子集  
+- 低从众用户组  
+- **factual vs deconfounded** 两套指标，以及 `do(C)` 下 top-k 稳定性  
 
 ---
 
-## 8. 与 GETNext 模块的具体挂钩清单
+## 8. 建议实验顺序
 
-| 模块 | 现状 | 因果向改动 |
-|------|------|------------|
-| `graph_X` / `checkin_cnt` | 直接进 GCN | 拆出为 $C_{\mathrm{pop}}$ / $h_c$；GCN 更侧重 cat + 区域特征 |
-| `graph_A` | 原始转移频次 | 距离桶内归一化；`/ pop(j)^α`；残差流进写实支路，不进 $h_z$ |
-| `NodeAttnMap` | `e * (A+1)` 加强群体流 | 拆成偏好注意力 × 结构门控；或仅加入 factual 路径 |
-| `UserEmbeddings` | 单一用户向量 | 显式 $h_z$（兴趣）+ $h_c$（从众/活跃/常驻 area） |
-| `TransformerModel` | 三头 POI/time/cat | 条件化 $C$ 的 POI 头；强化 cat 头；可选后门边缘化推理 |
-| `adjust_pred_prob_by_graph` | 直接加 attn_map | factual / deconfounded 两套聚合；deconf 路径避免再灌热门近邻 |
-| 损失 | CE(+time+cat) | + 对抗去混淆 + Group DRO；IPS 仅作稀有桶辅助 |
-| 评估 | 全局 Acc@k / MRR | 距离桶、流行度四分位、跨 area、小众用户；外加 `do(C)` 排序稳定性 |
+1. **诊断**：命中样本的距离/pop 分布；去掉输出偏置、打乱距离特征看跌多少。  
+2. **序列侧轻量干预**：同距离环带负采样；$s_{\mathrm{pref}}+s_{\mathrm{access}}$ 分解。  
+3. **表征去混淆**：$h_z/h_c$ + 后门边缘化 + Group DRO（主推）。  
+4. **Area 条件化**与双模式推理。  
+5. 需要时再对比“加/不加图先验”的消融——图不是前提。
 
 ---
 
-## 9. 建议的实验顺序（由易到难）
+## 9. 风险与边界
 
-不必一上来上完整可识别 SCM。建议：
-
-1. **诊断**  
-   - 统计训练转移距离分布、命中样本的距离分布、top-k 候选的平均 pop。  
-   - `do(pop)` / 去掉 `checkin_cnt` / 去掉 `NodeAttnMap` 的消融，看指标与长尾子集变化。
-
-2. **轻量干预（含或不含 IPS）**  
-   - $A$ 的 pop/距离归一化；同距离环带负采样。  
-   - 可选：距离分层 IPS（裁剪）作基线对照。
-
-3. **SCM + Deconfounded / 表征方法（主推）**  
-   - 定义 $C$，实现 $h_z/h_c$ 分解 + 对抗或正交约束。  
-   - 条件头 + 推理时后门边缘化 / `do(C=\bar{c})`。  
-   - 按环境做 Group DRO；对比“仅 IPS”与“仅表征去混淆”与“两者结合”。
-
-4. **结构分数分解**  
-   - $s = s_{\mathrm{pref}}(h_z) + s_{\mathrm{access}} + s_{\mathrm{pop}}(u) + s_{\mathrm{area}}$。  
-   - area 特征与区域流图。
-
-5. **反事实评估协议**  
-   - 固定报告：整体指标 + 远跳 + 长尾 POI + 跨 area + 低从众用户组。  
-   - 报告 factual vs deconfounded 两套指标，避免只看被近邻/热门刷高的 Acc@1。
+- 真实下一跳确实受可达性与流行度影响；完全 `do(C=\bar{c})` 适合“兴趣推断”，不一定适合“写实预测”。  
+- $Z$ 与常驻 area 不可完美识别；做敏感性分析。  
+- 对抗训练需 partial disentanglement，避免抽干有用信息。  
+- 词表极大时，去偏后的全 Softmax 仍贵；可用候选生成 + 重排，但重排阶段同样要带 $C$ 分解。
 
 ---
 
-## 10. 风险与边界
+## 10. 一句话收束
 
-- **过度去偏**：可达性与流行度在真实世界里*确实*影响下一跳；完全 `do(access=1), do(pop=0)` 的预测会不切实际。要分清任务：是“预测真实下一签到”还是“推断潜在兴趣”。
-- **不可识别性**：没有随机实验或强工具变量时，偏好与居住地/常驻 area 无法完美分开；应用条件化与敏感性分析（改变 β / 边缘化分布看排序稳定性）。因果发现学到的图不宜过度信任。
-- **对抗训练不稳**：$h_z \perp C$ 过强会伤有用信号；优先 partial disentanglement + 重建 $C$ 的 $h_c$ 支路。
-- **方差**：纯 IPS 与长尾上采样可能伤整体 Acc；表征方法相对更稳，仍需 Group DRO / 多目标，保证近邻主群体不明显崩坏。
-- **图泄漏**：`A` 若含验证/测试时段转移，去偏结论会偏乐观；应严格只用训练期构图（当前 `build_graph.py` 流程需保持这一点）。
+从 Transformer 理念看，next-POI 的因果问题是：**序列模型把观测转移的生成约束（近、热、区）当成了可注意力、可 Softmax 的“语义”**。  
+去偏应落在 **上下文表征拆分、解码打分分解、跨环境不变与 `do(C)` 推理**，而不是依赖是否使用 GCN。GCN 只是 POI embedding 的一种来源；换查表嵌入，同一套 SCM 与 deconfounded training 仍然成立。
 
 ---
 
-## 11. 一句话收束
+## 附录 A. 若对照 GETNext：GCN 只是可选放大镜
 
-GETNext 很强地拟合了**群体轨迹流 + 序列上下文**，但也因此把**邻近可达、热门曝光、区域土地用途**写进了“偏好”。用因果视角，不必停在 IPS：用 **SCM 因果图** 标明混杂路径，再用 **deconfounded training / 表征解耦（$h_z \perp C$）/ 跨环境不变** 把偏好与约束拆开，配合切片与 `do(C)` 评估，才能检验模型是否还看得见那些“偶尔走远、偏爱小众、跨区行动”的用户。
+GETNext =（可选）轨迹流图 GCN POI 嵌入 + Transformer 序列 +（可选）`NodeAttnMap` 加性先验。
+
+- **根因仍在序列 CE**；去掉 GCN/AttnMap，偏差不会自动消失。  
+- GCN/`checkin_cnt`/原始转移边权会 **额外** 把 pop 与近邻灌进 $e_p$ 与加性 logits，可能造成“表征一次 + 先验一次”的双重计入。  
+- 若保留图模块：让其只影响 factual 支路或 $h_c$，不要无约束打进 $h_z$。  
+- 研究去偏时，建议先在 **纯 Transformer + id embedding** 上验证因果模块，再决定是否加图。
+
+## 附录 B. 方法速查
+
+| 方法 | 作用位置 | 是否需要 GCN |
+|------|----------|--------------|
+| $s_{\mathrm{pref}}+s_{\mathrm{access}}+s_{\mathrm{pop}}+s_{\mathrm{area}}$ | 解码打分 | 否 |
+| $h_z/h_c$ 解耦 + 对抗 | Transformer 输出 | 否 |
+| 后门调整 / `do(C)` | 条件头与推理 | 否 |
+| Group DRO / IRM | 按环境划分的 CE | 否 |
+| 同距离环带对比 | 负采样 / 损失 | 否 |
+| IPS | 样本权重 | 否（辅助） |
+| 图边权归一化 / 移出 checkin_cnt | 仅当使用图编码器时 | 是（可选） |
