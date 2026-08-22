@@ -143,7 +143,7 @@ $$
 
 - 主要作用：端到端从历史 ($H$) 学习兴趣 ($Z$) 与短时依赖，输出主表征 $h$。
 - 输入：历史 token 序列（形式上可拼接/注入 $C_{\mathrm{pop}}$、$C_{\mathrm{area}}$、$C_{\mathrm{access}}$ 特征）。
-- 注意：transformer 本身只近似学习 $H\to Y$、$Z\to Y$ 的综合路径。
+- 注意：transformer 本身只近似学习 $H\to Y$、$Z\to Y$ 的综合路径（展开见附录 C）。
 
 **2. 额外变量的处理和注入：**
 
@@ -152,11 +152,13 @@ $$
 
 **3. Loss/目标增强手段:**
 
-- 对抗流行度/可达性偏差，可设计 reweighting loss（如 distance bucket 采样、流行度 IPS 提升长尾）。
-- 也可将 $C_{\mathrm{pop}}$/$C_{\mathrm{access}}$ 做 confounder 干预（如 $do(C=\ldots)$ 分析）或边缘化处理。
-- 评估指标应区分各类混杂因子下的效果（如分 distance、popularity 分桶 Acc@K），避免仅反映热门/近邻。
+- 对抗流行度/可达性偏差，可设计 reweighting loss（如 distance bucket 采样、流行度 IPS 提升长尾）。 “TODO: 具体怎么实现呢？distangle 各个部分的embedding，比如h_{pop}, h_{interest}, h_{short_interest}, h_{area}，可以看作是因果学习吗？”
+- 也可将 $C_{\mathrm{pop}}$/$C_{\mathrm{access}}$ 做 confounder 干预（如 $do(C=\ldots)$ 分析）或边缘化处理。 “TODO: 什么是边缘化处理？具体化confounder干预”
+- 评估指标应区分各类混杂因子下的效果（如分 distance、popularity 分桶 Acc@K），避免仅反映热门/近邻。 “TODO: 这里的意思是根据POI的距离评估模型，以及根据POI的popularity评估模型吗？”
 
 ---
+
+TODO: 数据处理，怎么获取各个外部变量？交通网络层的access，而不是单纯经纬度的access。
 
 **总结建议与结论：**
 
@@ -173,7 +175,7 @@ P(Y\mid h_z,\; do(C=\bar{c}))
 \sum_c P(Y\mid h_z,c)\,P(c)
 $$
 
-即：让 Transformer 学的主表征尽量接近偏好 $Z$，再对混杂 $C$ 做干预或边缘化。
+即：让 Transformer 学的主表征尽量接近偏好 $Z$，再对混杂 $C$ 做干预或边缘化。 TODO: 这一步中，h_z获取了，但是不能单纯用h_z进行预测吧？其他的因素对预测准确性非常重要，应该怎么处理？
 
 POI embedding 来源（查表 / GCN / …）只影响 $H$ 如何被数值化，**不改变这张因果图的主干**。
 
@@ -215,14 +217,16 @@ P(Y\mid h_z,\; do(C=\bar c))
 \sum_c P(Y\mid h_z,c)\,P(c)
 $$
 
-后者即后门调整形式。写实 vs 去混淆是 **两种推理模式**，不是互相否定。
+TODO: 这两者是等价的吗？do(C)和\sum P(Y|c)P(c)
+
+后者即后门调整形式。写实 vs 去混淆是 **两种推理模式**，不是互相否定。 TODO: 具体说说写实和去混淆的区别，举例说明，两者都可以作为因果吗？
 
 ### 3.3 识别假设（写清楚才能谈算法）
 
 要对 $C$ 做后门调整，至少需要：
 
-1. **混杂可测（或有足够代理）**：$C$ 阻断 $Z\to Y$ 之外、经混杂进入 $Y$ 的路径。遗漏的 $U$ 若同时影响 $H$ 与 $Y$，调整仍有偏。
-2. **正性（positivity）**：对关心的 $(h_z,c)$ 组合，$P(C=c\mid h_z)>0$。距离极远或极冷门桶经常违规，边缘化方差会爆。
+1. **混杂可测（或有足够代理）**：$C$ 阻断 $Z\to Y$ 之外、经混杂进入 $Y$ 的路径。遗漏的 $U$ 若同时影响 $H$ 与 $Y$，调整仍有偏。 TODO: 这一部分没有看懂。
+2. **正性（positivity）**：对关心的 $(h_z,c)$ 组合，$P(C=c\mid h_z)>0$。距离极远或极冷门桶经常违规，边缘化方差会爆。 TODO: 没看懂，这部分是用来干什么的？是后门调整的前提条件吗？什么叫违规？边缘化方差是什么，爆了会怎么样？
 3. **$Z$ 的代理充分性**：$h_z$ 需近似 $Z$ 且尽量不携带 $C$。这不可由数据单独证明，要用 §5 的解耦约束去逼近，并用敏感性分析（§8）检查。
 4. **可加性等功能形式**（可选、更强）：分数分解还假设偏好与混杂在 logit 上近似可加；该假设失败时，$s_{\mathrm{pref}}$ 仍可能吸收 $C$。
 
@@ -294,6 +298,8 @@ $$
 
 流行度 / 区域同理并入 $g(c,p)$。$s_{\mathrm{access}}$ 由距离、活动半径、时间预算等给出，**不要**再偷塞回无名 $h$。
 
+TODO: 具体解释这两个公式，有什么联系吗？是上面的概率公式推导出下面的score公式吗？以及各个符号、函数的意义，为什么这样设计。
+
 **理论要点：** 若可加性大致成立，把 $g$ 参数化为显式支路、$m$ 交给 Transformer，可降低 $C$ 泄漏进 $h$ 的诱因。这是功能形式约束，不是完整识别。
 
 **风险：** 支路欠定或过弱时，$m$ 仍吸收 $C$（省略偏差）。支路过强（例如硬距离核）会把真实的“愿意走远看展览”也罚掉。推理时 $\lambda$ 可调：写实保留，去混淆缩小或边缘化。
@@ -308,7 +314,7 @@ $$
 P(Y\mid h_z,c=\bar c).
 $$
 
-**假设：** §3.3 的后门 + 正性；且 $h_z$ 是 $Z$ 的充分代理。对抗项在经验分布上惩罚 $I(h_z;C)$，**不保证**因果充分，只减小后门残留。
+**假设：** §3.3 的后门 + 正性；且 $h_z$ 是 $Z$ 的充分代理。对抗项在经验分布上惩罚 $I(h_z;C)$，**不保证**因果充分，只减小后门残留。 TODO: I(h_z;C)是什么？什么是不保证因果充分？
 
 **形式：**
 
@@ -328,9 +334,11 @@ $$
 - 推理写实：用真实 $c$。
 - 推理去混淆：$\sum_{c'}P(Y\mid h_z,c')\hat P(c')$ 或 $do(C=\bar c)$。
 
+TODO: 具体CE(\cdot, \cdot)该怎么实现？添加损失，让h_c分别预测C吗？但是C作为输入，又作为损失的预测目标吗？推理去混杂的两个公式有区别的？是等价的吗？还是两种不同的去混杂方式？
+
 完全 $h\perp C$ 过强（兴趣与常驻 area 相关）。只对 $h_z$ 去 $C$；$h_c$ 吃混杂并进入 access / pop / area 支路。
 
-**风险：** 正性不足时边缘化方差大，需对 $c$ 分桶而非逐值求和。对抗过强会抽干 $h_z$ 中与常驻地绑定、但属于 $Z$ 的信息 → 保持 partial disentanglement。
+**风险：** 正性不足时边缘化方差大，需对 $c$ 分桶而非逐值求和。对抗过强会抽干 $h_z$ 中与常驻地绑定、但属于 $Z$ 的信息 → 保持 partial disentanglement。 TODO: 什么是边缘化方差过大？有什么影响？
 
 ### 5.3 同距离环带负采样 / 对比
 
@@ -349,6 +357,8 @@ $$
 这是 **分层条件化**，不是完整后门；对可达性捷径最直接。跨桶聚合或按桶报告评估，避免近邻样本淹没一切。
 
 **风险：** 桶太粗 → 桶内仍有 pop；太细 → 样本稀疏、对比崩溃。应与 5.1 / 5.2 叠用，而不是单独当作 $do(C)$。
+
+TODO: 具体说明怎么叠加实现。
 
 ### 5.4 IPS（辅助）
 
@@ -378,6 +388,8 @@ $$
 
 **风险：** 切片过细导致每组过少；只优化最难组可能牺牲写实主指标。优先对类别头做不变约束（更贴 $Z$），POI_id 头仍可条件化 $C$。
 
+TODO: 不了解这个算法，DRO和IRM是什么？这个公式怎么来的？w是什么？
+
 ### 5.6 与语言模型技巧的类比
 
 | LM / Transformer NLP | Next-POI 对应 | 主要落在 |
@@ -392,19 +404,23 @@ $$
 
 ### 5.7 最小实现草图（纯序列，无 GCN 假设）
 
+完整输入→输出→损失→双模式推理规格见 **附录 D**（§5.1 + §5.2 合并实现）。
+
 ```text
 输入: 历史 POI/time/cat/user + 可算的 C 特征     # §2
 Enc:  Embedding + Transformer → h               # 实现层；不是 DAG 节点
 Split: h → h_z, h_c                             # h_z 代理 Z
-Loss:  CE(Y | h_z, h_c)                         # 拟合 P(Y|h_z,h_c)  §5.2
-     + λ1 * Adv(C | h_z)                        # 逼 I(h_z;C)↓      §5.2
-     + λ2 * Pred(C | h_c)                       # h_c 吃混杂        §5.2
-     + λ3 * GroupDRO(env)                       # 跨 C 切片不变     §5.5
-     + 可选 环带对比 / 裁剪 IPS                  # §5.3 / §5.4
-解码:  s = Dot(h_z, e_p) + g_access + g_pop + g_area   # §5.1, §6
-推理_deconf:  用 c̄ 或边缘化 C；可关掉 g_pop / 缩小 g_access
-推理_factual: 用真实 C
+Decode: s_pref(p)=⟨h_z,e_p⟩; s_conf(p)=g(C(p))+⟨W_c h_c,ψ(p)⟩; s=s_pref+s_conf
+Loss:  L_main = CE(Y | s)                       # P(Y|H,C)，主损失      附录 D.4.1
+     + λ_pref * L_pref (环带对比 on s_pref)     # 偏好通道            附录 D.4.2
+     + λ_conf * L_conf (align s_conf ↔ g̃(C))   # 混杂通道            附录 D.4.3
+     + λ_adv  * Adv(C | h_z)                    # h_z⊥C               附录 D.4.4
+     + λ_recon* CE(C | h_c)                     # h_c 重建 C          附录 D.4.4
+推理_deconf:  argmax s_pref；或边缘化 s_conf
+推理_factual: argmax s = s_pref + s_conf
 ```
+
+TODO: g_access, g_pop, g_area分别是什么？e_p又是什么，是transformer的序列输出吗？
 
 POI 向量 $e_p$ 可以是 `nn.Embedding`；若某系统用 GCN 生成 $e_p$，只需保证 **流行度与原始转移频次不要二次灌进 $h_z$**（附录 A）。
 
@@ -501,3 +517,409 @@ GETNext =（可选）轨迹流图 GCN POI 嵌入 + Transformer 序列 +（可选
 | 同距离环带对比 | 负采样 / 损失 | $P(Y\mid H,C_{\mathrm{access}}\in b)$ | 否 |
 | IPS | 样本权重 | 稀有单元的 HT 加权（辅助） | 否 |
 | 图边权归一化 / 移出 checkin_cnt | 仅当使用图编码器时 | 减少 $C$ 二次灌入 $e_p$ | 是（可选） |
+
+---
+
+## 附录 C. 补充说明：为何 Transformer「只近似」学习 $H\to Y$、$Z\to Y$ 的综合路径
+
+> 对应 §2 实现建议中「注意：transformer 本身只近似学习 $H\to Y$、$Z\to Y$ 的综合路径」一句的展开说明。
+
+### C.1 一句话版
+
+标准 Transformer 的输入只有 $H$，监督目标是 $P(Y\mid H)$。它**不会**分别学出因果图里的 $H\to Y$ 和 $Z\to Y$ 两条机制，而是学一个**混在一起**的映射；其中 $Z\to Y$ 还是**经 $H$ 间接推断**的，所以只能说「近似」。
+
+### C.2 为什么说学的是「综合路径」？
+
+因果图里到 $Y$ 的路径不止一条：
+
+```text
+Z ──→ Y          （兴趣直接影响下一跳）
+Z ──→ H ──→ Y    （兴趣先塑造历史，历史再影响下一跳）
+H ──→ Y          （纯历史惯性 / 短程记忆）
+C ──→ H, C ──→ Y （混杂也混进来）
+```
+
+但典型训练是：
+
+$$
+\min_\theta \; -\log P_\theta(Y \mid H)
+$$
+
+模型只看见 $(H, Y)$，**看不见 $Z$**。因此它拟合的是**一个**条件分布 $P(Y\mid H)$，里面同时包含：
+
+| 因果成分 | 在 $P(Y\mid H)$ 里怎么体现 |
+|----------|---------------------------|
+| $H\to Y$ | 最近去过哪、重复访问、转移模式 |
+| $Z\to Y$ | 只能通过 $H$ 里残留的偏好信号间接体现 |
+| $Z\to H\to Y$ | 和上面纠缠在一起，分不开 |
+| $C\to H, C\to Y$ | $C$ 已写进 $H$（近、热、区），又直接影响 $Y$，形成捷径 |
+
+所以不是「Transformer 专门学 $H\to Y$，另外再学 $Z\to Y$」，而是**一个网络把多条路径压成一个函数**：
+
+$$
+h = \mathrm{TF}(H), \quad \hat{Y} = \mathrm{softmax}(s(h, \cdot))
+$$
+
+这在实现上等价于学 $P(Y\mid H)$，不是学干净的 $P(Y\mid Z)$ 或单独的 $P(Y\mid H, Z)$。
+
+### C.3 为什么说「只近似」？
+
+「近似」有三层意思：
+
+**（1）$Z$ 不可直接观测**
+
+$Z$ 是隐变量，只能从 $H$ 反推。数学上：
+
+$$
+P(Y\mid H) = \sum_{z,c} P(Y\mid H, z, c)\, P(z, c\mid H)
+$$
+
+Transformer 的 $h$ 是在逼近某个 $P(Y\mid H)$ 的充分统计，**不保证** $h \approx Z$，更不保证把 $H\to Y$ 与 $Z\to Y$ 拆开。
+
+**（2）$H$ 里已经混了 $C$**
+
+因为 $C\to H$，历史序列本身带近邻、热门、区域偏置。模型从 $H$ 预测 $Y$ 时，会把「兴趣」和「混杂捷径」一起学进去——§1 里 embedding / attention / softmax 那些捷径就是这个结果。
+
+**（3）损失函数不区分路径**
+
+CE 只要求「给定 $H$，把真实 $Y$ 打高分」。它**不奖励**「这条预测来自 $Z$」或「这条来自纯 $H$ 惯性」。哪条路径 loss 更低，模型就走哪条——往往是近、热、区捷径。
+
+因此：Transformer **可以**从历史里**隐式**抽出一部分偏好（对应 $Z$），也会学历史惯性（$H\to Y$），但两者**缠在一个 $h$ 里**，且都带 $C$ 污染——这就是「近似」。
+
+### C.4 与正文其他章节的对应
+
+- §2 表格里写 $Z$「需端到端学习」「通过 Transformer 内隐建模」——$Z$ 没有独立输入，只能藏在 $h$ 里。
+- §2 末的目标 $P(Y\mid h_z, do(C))$ —— 正因为标准 Transformer **只近似**综合路径，才需要后面把 $h$ 拆成 $h_z$ / $h_c$、打分分解、后门调整等（§5），去逼近「偏好」而不是「观测捷径」。
+
+### C.5 直觉类比
+
+把用户下一跳想成考试答题：
+
+- $Z$：真实兴趣（内心）
+- $H$：过去答题记录（已观测）
+- $Y$：下一题选什么
+
+老师只给你「过去记录 → 预测下一题」，不给你「内心兴趣」标签。你能从记录猜兴趣，但猜不准；记录里还有「最近常选附近选项」「常选热门选项」等噪声。你学到的是「综合猜题策略」，不是单独识别「兴趣驱动」和「惯性驱动」。
+
+---
+
+## 附录 D. 实现规格：分数分解（§5.1）+ 双表征后门调整（§5.2）
+
+本节给出一种可落地的端到端方案，将 §5.1 的可加打分分解与 §5.2 的 $(h_z,h_c)$ 解耦及后门训练约束合并为单一模型。叙述采用「符号定义 → 数据构造 → 前向计算 → 损失 → 推理」的论文体例；不展开 Transformer、MLP 等模块的内部层结构。
+
+### D.1 符号与任务定义
+
+设 POI 词表 $\mathcal{P}=\{1,\ldots,|\mathcal{P}|\}$，用户集合 $\mathcal{U}$。一条训练样本由用户 $u\in\mathcal{U}$、历史轨迹与预测时刻构成：
+
+$$
+H=(p_1,t_1,a_1),\ldots,(p_T,t_T,a_T),\qquad p_i\in\mathcal{P},
+$$
+
+其中 $t_i$ 为时间特征（如日内归一化时刻），$a_i$ 为 POI 类别 id。记 **当前位** $p_T$ 为 origin，**监督标签** $Y=p_{T+1}\in\mathcal{P}$。
+
+混杂向量取离散化形式（分桶后便于后门边缘化）：
+
+$$
+C=(c_{\mathrm{acc}},\,c_{\mathrm{pop}},\,c_{\mathrm{area}},\,c_{\mathrm{hour}}),
+$$
+
+分别对应距离桶、目标 POI 流行度档、区域 id、时刻桶。对 **候选 POI** $p\in\mathcal{P}$，记其候选级混杂
+
+$$
+C(p)=\big(c_{\mathrm{acc}}(p_T,p),\,c_{\mathrm{pop}}(p),\,c_{\mathrm{area}}(p),\,c_{\mathrm{hour}}(t_T)\big).
+$$
+
+**重要约定（无标签泄漏）：** $C(p)$ 仅依赖 $H$、候选 $p$ 的静态属性及 $p_T$，不将「到 $Y$ 的距离」注入所有候选共享的上下文向量；训练时 $C(Y)$ 只是 $C(p)$ 在 $p=Y$ 时的取值（见 D.3.4）。
+
+模型学习条件分布 $P_\theta(Y\mid H,C)$ 的 deconfounded 近似，通过兴趣代理 $h_z$、混杂摘要 $h_c$ 与可加打分 $s=s_{\mathrm{pref}}+s_{\mathrm{conf}}$ 实现。
+
+### D.2 数据预处理与查表
+
+**静态 POI 表** $\mathcal{T}_{\mathrm{poi}}$（训练集一次统计，全体样本共享）：
+
+| 字段 | 含义 | 用途 |
+|------|------|------|
+| $\mathrm{pop}(p)$ | POI $p$ 的训练集 check-in 频次 | $c_{\mathrm{pop}}(p)$ |
+| $\mathrm{area}(p)$ | 网格 / 行政区 id | $c_{\mathrm{area}}(p)$ |
+| $\mathrm{lat}(p),\mathrm{lon}(p)$ | 坐标 | 距离计算 |
+| $e_p\in\mathbb{R}^{d_e}$ | POI 嵌入（查表，可选预训练） | 解码点积 |
+
+**距离与分桶：** 预计算或运行时查询
+
+$$
+d(p_T,p)=\mathrm{Dist}(p_T,p)\quad(\text{Haversine 或路网距离}),
+\qquad
+c_{\mathrm{acc}}(p_T,p)=\mathrm{Bucket}(d(p_T,p)).
+$$
+
+**样本级量（仅来自 $H$）：** 用户 id $u$；当前时刻桶 $c_{\mathrm{hour}}(t_T)$。可选：由历史推断锚点 $\hat p_{\mathrm{home}}(u)$（与 $Y$ 无关）。
+
+训练 DataLoader 输出元组：
+
+$$
+\bigl(u,\; H,\; Y,\; p_T,\; t_T,\; \{C(p)\}_{p\in\mathcal{S}}\bigr),
+$$
+
+其中 $\mathcal{S}\subseteq\mathcal{P}$ 为全词表或本步采样的候选子集（含正样本 $Y$）。
+
+### D.3 模型结构与前向传播
+
+整体分为 **编码器** $\mathcal{E}$、**表征拆分** $\mathcal{S}$、**解码器** $\mathcal{D}$、**混杂头** $\mathcal{G}$ 四部分。
+
+```text
+H  ──►  E  ──►  h  ──►  S  ──►  (h_z, h_c)
+                              │
+         候选 p ∈ S ──────────┼──►  D(h_z, h_c, e_p, C(p))  ──►  s(p)
+                              │
+                              └──►  G_conf(h_c)  ──►  ĉ  (训练期辅助)
+```
+
+#### D.3.1 编码
+
+$$
+h=\mathcal{E}(H,u)\in\mathbb{R}^{d},
+$$
+
+$\mathcal{E}$ 以 $(p_{1:T},t_{1:T},a_{1:T},u)$ 为输入，经序列编码器得到 **最后时间步** 上下文向量 $h$（或等价地 pooling 末位表征）。$h$ 不直接参与最终 POI 排序，仅作为后续拆分的输入。
+
+#### D.3.2 表征拆分
+
+$$
+h_z=\mathcal{S}_z(h)\in\mathbb{R}^{d_z},\qquad h_c=\mathcal{S}_c(h)\in\mathbb{R}^{d_c}.
+$$
+
+语义约定：$h_z$ 为兴趣代理 $Z$ 的表示；$h_c$ 为混杂摘要，供条件化预测与 $C$ 重建。
+
+#### D.3.3 解码：可加打分与条件分布（§5.1）
+
+对每个候选 $p\in\mathcal{S}$，定义 **总 logit** 与 **分通道 logit**：
+
+$$
+s(p)=s_{\mathrm{pref}}(p)+s_{\mathrm{conf}}(p).
+$$
+
+**偏好通道**（仅含 $h_z$，对应 §5.1 的 $m(z,p)$）：
+
+$$
+s_{\mathrm{pref}}(p)=\langle h_z,\,e_p\rangle.
+$$
+
+**混杂通道**（候选级、仅依赖 $\phi(\cdot,p)$ 与 $h_c$，对应 §5.1 的 $g(c,p)$）：
+
+$$
+s_{\mathrm{conf}}(p)=g_{\mathrm{acc}}\bigl(\phi_{\mathrm{acc}}(p_T,p)\bigr)
++g_{\mathrm{pop}}\bigl(\phi_{\mathrm{pop}}(p)\bigr)
++g_{\mathrm{area}}\bigl(\phi_{\mathrm{area}}(p_T,p)\bigr)
++\langle W_c h_c,\,\psi(p)\rangle.
+$$
+
+$\phi_{\mathrm{acc}}$ 为 $d(p_T,p)$ 或 $c_{\mathrm{acc}}(p_T,p)$ 的嵌入；$\phi_{\mathrm{pop}}(p)=\log(1+\mathrm{pop}(p))$；$\phi_{\mathrm{area}}$ 为 $(\mathrm{area}(p_T),\mathrm{area}(p))$ 的联合嵌入；$g_{\cdot}$ 为标量输出头；$\psi(p)$ 为 POI 侧辅助嵌入。最后一项 $\langle W_c h_c,\psi(p)\rangle$ 编码 **无法完全查表** 的上下文混杂（时段、情境），可选。
+
+**条件分布（主任务所拟合对象）：**
+
+$$
+P_\theta(Y=p\mid H,C)=\frac{\exp\bigl(s_{\mathrm{pref}}(p)+s_{\mathrm{conf}}(p)\bigr)}
+{\sum_{p'\in\mathcal{S}}\exp\bigl(s_{\mathrm{pref}}(p')+s_{\mathrm{conf}}(p')\bigr)}.
+$$
+
+**要点：** $P(Y\mid H,C)$ 由 **总分数 $s$** 经 softmax 定义；$s_{\mathrm{pref}}$、$s_{\mathrm{conf}}$ 各自 **不是** 完整的 $P(Y\mid H,C)$，而是可分解、可单独约束与干预的子通道。全词表训练时 $\mathcal{S}=\mathcal{P}$；大规模词表可用 sampled softmax，$\mathcal{S}=\{Y\}\cup\mathcal{N}$。
+
+#### D.3.4 候选级特征与无泄漏性
+
+对任意 $p\in\mathcal{S}$，$s_{\mathrm{conf}}(p)$ 与 $s_{\mathrm{pref}}(p)$ 中凡依赖地理/流行的量，均通过 $\phi(\cdot,p)$ 计算，**推理时可对全体 $p$ 复现**。训练时
+
+$$
+s(Y)=s_{\mathrm{pref}}(Y)+s_{\mathrm{conf}}(Y)
+$$
+
+仅为 $p=Y$ 的特例，不构成将 $Y$ 独有信息注入共享 $h$ 的泄漏。$C$ 不作为 Transformer 输入 token 拼入 $H$；若需条件化，仅通过 $h_c$ 与 $s_{\mathrm{conf}}(p)$ 进入。
+
+仅为 $p=Y$ 的特例，不构成将 $Y$ 独有信息注入共享 $h$ 的泄漏。$C$ 不作为 Transformer 输入 token 拼入 $H$；经 $h_c$ 与 $s_{\mathrm{conf}}(p)$ 进入模型。
+
+### D.4 训练目标：主损失 + 分通道辅助损失
+
+采用 **多任务** 结构：主损失用总 $s$ 拟合 $P(Y\mid H,C)$；$s_{\mathrm{pref}}$、$s_{\mathrm{conf}}$ 各有辅助损失，分别约束兴趣通道与混杂通道，避免两路信号全部挤进单一 CE。
+
+$$
+\mathcal{L}
+=\underbrace{\mathcal{L}_{\mathrm{main}}}_{P(Y\mid H,C)}
++\lambda_{\mathrm{pref}}\underbrace{\mathcal{L}_{\mathrm{pref}}}_{s_{\mathrm{pref}}\text{ 通道}}
++\lambda_{\mathrm{conf}}\underbrace{\mathcal{L}_{\mathrm{conf}}}_{s_{\mathrm{conf}}\text{ 通道}}
++\lambda_{\mathrm{adv}}\underbrace{\mathcal{L}_{\mathrm{adv}}}_{h_z\perp C}
++\lambda_{\mathrm{recon}}\underbrace{\mathcal{L}_{\mathrm{recon}}}_{h_c\to C}.
+$$
+
+超参 $\lambda_{\mathrm{pref}},\lambda_{\mathrm{conf}},\lambda_{\mathrm{adv}},\lambda_{\mathrm{recon}}\ge 0$。推荐 $\mathcal{L}_{\mathrm{main}}$ 权重为 1，其余取 $10^{-2}\sim10^{-1}$ 量级并按验证集调节。
+
+#### D.4.1 主损失：总 $s$ 拟合 $P(Y\mid H,C)$
+
+$$
+\mathcal{L}_{\mathrm{main}}
+=-\log P_\theta(Y\mid H,C)
+=-s(Y)+\log\sum_{p\in\mathcal{S}}\exp\bigl(s(p)\bigr),
+\qquad s(p)=s_{\mathrm{pref}}(p)+s_{\mathrm{conf}}(p).
+$$
+
+这是 **唯一** 直接优化完整条件分布 $P(Y\mid H,C)$ 的项；factual 预测精度主要由 $\mathcal{L}_{\mathrm{main}}$ 决定。$\mathcal{L}_{\mathrm{pref}}$、$\mathcal{L}_{\mathrm{conf}}$ 不替代该项，只塑造两通道分工。
+
+#### D.4.2 偏好通道损失 $\mathcal{L}_{\mathrm{pref}}$
+
+约束 $s_{\mathrm{pref}}$ 在 **同等可达** 条件下学习偏好序，防止 $\mathcal{L}_{\mathrm{main}}$ 将全部预测压力泄入 $s_{\mathrm{conf}}$。
+
+**（a）同距离环带对比（推荐，§5.3）：** 设 $\mathcal{N}_b(Y)$ 为与 $Y$ 同距离桶 $b=c_{\mathrm{acc}}(p_T,Y)$ 的负例集，
+
+$$
+\mathcal{L}_{\mathrm{pref}}
+=-\log\frac{\exp\bigl(s_{\mathrm{pref}}(Y)\bigr)}
+{\exp\bigl(s_{\mathrm{pref}}(Y)\bigr)+\sum_{p^{-}\in\mathcal{N}_b(Y)}\exp\bigl(s_{\mathrm{pref}}(p^{-})\bigr)}.
+$$
+
+仅在 $s_{\mathrm{pref}}$ 上做 softmax，逼近「$C_{\mathrm{access}}$ 近似固定时」的偏好排序。
+
+**（b）类别辅助（可选）：** 从 $h_z$ 预测 $a_Y$（$Y$ 的 POI 类别），
+
+$$
+\mathcal{L}_{\mathrm{pref}}^{(\mathrm{cat})}=\mathrm{CE}\bigl(a_Y,\,\mathrm{Head}_{\mathrm{cat}}(h_z)\bigr),
+$$
+
+可与 (a) 加权相加：$\mathcal{L}_{\mathrm{pref}}=\mathcal{L}_{\mathrm{pref}}^{(\mathrm{ring})}+\eta\,\mathcal{L}_{\mathrm{pref}}^{(\mathrm{cat})}$。类别更贴 $Z$，有助于 $h_z$ 承载兴趣。
+
+#### D.4.3 混杂通道损失 $\mathcal{L}_{\mathrm{conf}}$
+
+约束 $s_{\mathrm{conf}}$ 显式承担近/热/区效应，减轻 $h_z$ 与 $e_p$ 吸收混杂捷径。
+
+**（a）混杂打分对齐：** 用查表特征构造 **先验混杂分**（stop-gradient）：
+
+$$
+\tilde g(p)=\tilde g_{\mathrm{acc}}\bigl(\phi_{\mathrm{acc}}(p_T,p)\bigr)
++\tilde g_{\mathrm{pop}}\bigl(\phi_{\mathrm{pop}}(p)\bigr)
++\tilde g_{\mathrm{area}}\bigl(\phi_{\mathrm{area}}(p_T,p)\bigr),
+$$
+
+$\tilde g_{\cdot}$ 可为线性层或手工递减函数（如 $-\alpha\, d(p_T,p)-\beta\log\mathrm{pop}(p)$）。令
+
+$$
+\mathcal{L}_{\mathrm{conf}}^{(\mathrm{align})}
+=\frac{1}{|\mathcal{S}'|}\sum_{p\in\mathcal{S}'}
+\bigl(s_{\mathrm{conf}}(p)-\tilde g(p)\bigr)^2,
+$$
+
+$\mathcal{S}'\subseteq\mathcal{S}$ 为 mini-batch 内候选子集（含 $Y$ 与负例）。该项促使 $s_{\mathrm{conf}}$ 追踪可观测 $C(p)$，而不依赖 $Y$ 作为输入特征。
+
+**（b）混杂通道弱 CE（可选）：** 仅用 $s_{\mathrm{conf}}$ 做预测，
+
+$$
+\mathcal{L}_{\mathrm{conf}}^{(\mathrm{aux})}
+=-\log\frac{\exp\bigl(s_{\mathrm{conf}}(Y)\bigr)}
+{\sum_{p\in\mathcal{S}}\exp\bigl(s_{\mathrm{conf}}(p)\bigr)}.
+$$
+
+权重宜小（$\ll \mathcal{L}_{\mathrm{main}}$），否则 $s_{\mathrm{conf}}$ 会吞掉本属 $s_{\mathrm{pref}}$ 的信号。默认 $\mathcal{L}_{\mathrm{conf}}=\mathcal{L}_{\mathrm{conf}}^{(\mathrm{align})}$；需更强 factual 校准时再加 (b)。
+
+#### D.4.4 表征解耦：$\mathcal{L}_{\mathrm{adv}}$ 与 $\mathcal{L}_{\mathrm{recon}}$
+
+**对抗项**（§5.2，作用于 $h_z$，非 $s_{\mathrm{pref}}$ 公式内）：
+
+$$
+\mathcal{L}_{\mathrm{adv}}=\sum_k \mathrm{CE}\bigl(c^{(k)}(Y),\,D_{\mathrm{adv}}^{(k)}(h_z)\bigr),
+$$
+
+编码器侧最小化 $\mathcal{L}_{\mathrm{main}}+\lambda_{\mathrm{pref}}\mathcal{L}_{\mathrm{pref}}+\cdots-\lambda_{\mathrm{adv}}\mathcal{L}_{\mathrm{adv}}$（梯度反转），使 $h_z$ 难预测 $C$。
+
+**混杂重建**（§5.2，作用于 $h_c$）：
+
+$$
+\mathcal{L}_{\mathrm{recon}}=\sum_k \mathrm{CE}\bigl(c^{(k)}(Y),\,\mathcal{G}^{(k)}_{\mathrm{recon}}(h_c)\bigr).
+$$
+
+注意区分：$\mathcal{L}_{\mathrm{recon}}$ 监督 **向量 $h_c$** 重建 $C$；$\mathcal{L}_{\mathrm{conf}}$ 监督 **标量 $s_{\mathrm{conf}}(p)$** 对齐 $\tilde g(p)$。二者互补，不重复。
+
+#### D.4.5 损失分工小结
+
+| 损失 | 优化对象 | 作用 |
+|------|----------|------|
+| $\mathcal{L}_{\mathrm{main}}$ | $s=s_{\mathrm{pref}}+s_{\mathrm{conf}}$ | 拟合 $P(Y\mid H,C)$，主任务 |
+| $\mathcal{L}_{\mathrm{pref}}$ | 仅 $s_{\mathrm{pref}}$ | 同距离环带内学偏好；$h_z$ 承载兴趣 |
+| $\mathcal{L}_{\mathrm{conf}}$ | 仅 $s_{\mathrm{conf}}$ | 对齐 $\tilde g(C(p))$；近/热/区走混杂通道 |
+| $\mathcal{L}_{\mathrm{adv}}$ | $h_z$ | $h_z\perp C$ |
+| $\mathcal{L}_{\mathrm{recon}}$ | $h_c$ | $h_c$ 编码可观测 $C$ |
+
+**设计可行性：** 多任务在推荐与去偏文献中常见。关键是 $\mathcal{L}_{\mathrm{main}}$ 始终对 **相加后的 $s$** 做 CE，保证整体仍建模 $P(Y\mid H,C)$；分通道损失提供 **归纳偏置**，使去混淆推理时 $s_{\mathrm{pref}}$ 可单独使用或搭配干预后的 $s_{\mathrm{conf}}$。
+
+### D.5 推理：Factual 与 Deconfounded
+
+记 $\mathcal{S}$ 为候选 POI 集合（全词表或召回集）。对 $p\in\mathcal{S}$ 计算 $s_{\mathrm{pref}}(p)$ 与 $s_{\mathrm{conf}}(p)$。
+
+**（1）Factual 推理** — 估计 $P(Y\mid H,C_{\mathrm{obs}})$：
+
+- 用历史编码得 $h_z,h_c$；
+- $s_{\mathrm{conf}}(p)$ 使用 **真实** $\phi(p_T,p)$、$\mathrm{pop}(p)$、$\mathrm{area}(\cdot)$；
+- $\hat Y=\arg\max_{p\in\mathcal{S}} s(p)$。
+
+**（2）Deconfounded 推理（固定干预）** — 估计 $P(Y\mid h_z, do(C=\bar c))$：
+
+- $h_z,h_c$ 同 factual；
+- 将 $s_{\mathrm{conf}}(p)$ 中的 $\phi$ 换为常数 $\bar\phi$，或令 $s_{\mathrm{conf}}(p)\equiv 0$；
+- $\hat Y_{\mathrm{deconf}}=\arg\max_{p\in\mathcal{S}} s_{\mathrm{pref}}(p)$，或 $\arg\max_p\bigl[s_{\mathrm{pref}}(p)+\tilde s_{\mathrm{conf}}(p;\bar\phi)\bigr]$。
+
+因 $s_{\mathrm{pref}}$ 仅含 $h_z$，首选 **纯偏好排序** $\arg\max s_{\mathrm{pref}}$。
+
+**（3）Deconfounded 推理（边缘化）** — 估计 $\sum_c P(Y\mid h_z,c)P(c)$：
+
+对离散桶 $\{c_j\}_{j=1}^J$，用训练集频率 $\hat P(c_j)$：
+
+$$
+\bar s(p)=\sum_{j=1}^{J}\hat P(c_j)\,
+\bigl[s_{\mathrm{pref}}(p)+s_{\mathrm{conf}}(p;\,c_j)\bigr].
+$$
+
+$s_{\mathrm{pref}}(p)$ 与 $c_j$ 无关，边缘化只作用于 $s_{\mathrm{conf}}$。$J$ 不宜过大，以免正性不足导致方差膨胀（§3.3）。
+
+两套排序 $\hat Y$ 与 $\hat Y_{\mathrm{deconf}}$ **均应报告**（§7），分别对应写实预测与兴趣导向预测。
+
+### D.6 训练与推理算法
+
+**Algorithm 1** 训练一步（mini-batch）
+
+```text
+输入: batch {(u, H, Y)}，POI 表 T_poi，超参 λ_main=1, λ_pref, λ_conf, λ_adv, λ_recon
+1.  p_T ← H 的最后 POI；h ← E(H, u)；(h_z, h_c) ← S(h)
+2.  构造全体 p ∈ S 的 C(p)；s_pref(p) ← ⟨h_z, e_p⟩
+3.  s_conf(p) ← g_acc(φ_acc) + g_pop(φ_pop) + g_area(φ_area) + ⟨W_c h_c, ψ(p)⟩
+4.  s(p) ← s_pref(p) + s_conf(p)
+5.  L_main ← -s(Y) + log Σ_{p∈S} exp(s(p))                    // P(Y|H,C)
+6.  L_pref ← 环带对比 CE，仅在 s_pref 上（§D.4.2）              // 可选 + L_pref^(cat)
+7.  L_conf ← MSE(s_conf(p), g̃(p))  on S'                       // 可选 + 弱 CE on s_conf
+8.  L_adv ← Σ_k CE(c^(k)(Y), D_adv^(k)(h_z))；L_recon ← Σ_k CE(c^(k), G_recon^(k)(h_c))
+9.  L ← L_main + λ_pref·L_pref + λ_conf·L_conf + λ_recon·L_recon - λ_adv·L_adv
+10. 反向传播并更新参数
+```
+
+**Algorithm 2** Deconfounded 推理（单用户单步）
+
+```text
+输入: H, u, 候选集 S, 干预参数 c̄ 或边缘化分布 P̂(c)
+1.  (h_z, h_c) ← S(E(H, u))
+2.  factual:     对每个 p ∈ S 算 s(p) 用真实 C(p)；取 top-k
+3.  deconf (do):  将 s_conf 中 φ 换为 φ̄；取 top-k
+4.  deconf (sum): s̄(p) ← Σ_j P̂(c_j) · s(p; c_j)；取 top-k
+```
+
+### D.7 与理论目标的对应关系
+
+| 组件 | 理论角色（§5） | 说明 |
+|------|----------------|------|
+| $h_z$ | $Z$ 的代理 | $\mathcal{L}_{\mathrm{adv}}$ 减小 $C$ 泄漏 |
+| $h_c$ | 混杂摘要 | $\mathcal{L}_{\mathrm{recon}}$ 保证可重建 $C$ |
+| 推理 §D.5(2)(3) | $do(C)$ / 后门边缘化 | 测试兴趣排序 |
+
+本方案 **不保证** 因果效应可识别（§3.3），但通过 **主损失拟合 $P(Y\mid H,C)$** 与 **分通道辅助损失** 分工，将朴素 CE 分解为可解释的偏好与混杂路径，并支持双模式评估。
+
+### D.8 实现边界与默认选择
+
+1. **POI 嵌入 $e_p$：** 默认 `nn.Embedding`；若使用 GCN，$e_p$ 不得再含未归一化的 `checkin_cnt` 灌入 $h_z$（附录 A）。
+2. **词表规模：** $|\mathcal{S}|=|\mathcal{P}|$ 不可行时，用负采样估计 $\mathcal{L}_{\mathrm{main}}$；$\mathcal{L}_{\mathrm{pref}}$、$\mathcal{L}_{\mathrm{conf}}^{(\mathrm{align})}$ 在相同 $\mathcal{S}$ 上计算。
+3. **$C$ 粒度：** 距离 / 流行度 / 区域均用 **分桶** 而非连续值，便于 $\mathcal{L}_{\mathrm{recon}}$、$\mathcal{L}_{\mathrm{adv}}$ 与边缘化求和。
+4. **$\lambda$ 调节：** 若 $\mathcal{L}_{\mathrm{conf}}^{(\mathrm{aux})}$ 过大导致 $s_{\mathrm{conf}}$ 主导 $\mathcal{L}_{\mathrm{main}}$，应降低 $\lambda_{\mathrm{conf}}$ 或去掉弱 CE，仅保留 align。
+5. **不包含：** §5.4 IPS、§5.5 Group DRO 可作为正交扩展叠加，非本规格必需项；环带对比已纳入 $\mathcal{L}_{\mathrm{pref}}$。
+
