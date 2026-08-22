@@ -480,6 +480,7 @@ def _write_hist(save_dir, train_hist, val_hist):
 if __name__ == '__main__':
     warnings.filterwarnings('ignore', message='.*enable_nested_tensor.*')
     warnings.filterwarnings('ignore', message='.*verbose parameter is deprecated.*')
+    warnings.filterwarnings('ignore', message='.*mismatched src_key_padding_mask.*')
     args = parameter_parser()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)

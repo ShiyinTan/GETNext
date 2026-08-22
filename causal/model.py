@@ -154,7 +154,7 @@ class CausalNextPOI(nn.Module):
         src = src * math.sqrt(self.d_model)
         src = self.pos_encoder(src)
         seqlen = src.size(1)
-        # Causal mask so step t only sees 1..t (GETNext next-step training convention).
+        # Causal mask so step t only sees 1..t. Float additive mask is valid on torch 1.7 and 2.x.
         causal = torch.triu(
             torch.ones(seqlen, seqlen, device=src.device, dtype=src.dtype) * float('-inf'),
             diagonal=1,
