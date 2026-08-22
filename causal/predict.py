@@ -1,8 +1,12 @@
-"""Load a causal checkpoint and rank next POI under factual / deconfounded modes.
+"""加载因果模型 checkpoint，按附录 D.5 打出 factual / 去混淆 两套下一站排序。
 
-Reports overall Acc@k / MRR plus Appendix D §7 slices (distance bucket, pop
-quartile, same-area vs cross-area). Deconf scores are never mixed into the
-factual summary.
+和 GETNext 的 predict.py 对照：
+  - 同样读测试 CSV、同样只评轨迹最后一步、同样写出 metrics.json + predictions.jsonl
+  - 多出来的：每种推理模式各一份指标，并且按距离桶 / 热度档 / 是否跨区切开（§7）
+  - 去混淆分数不会并进 factual 的总表，两套分开报
+
+常用：
+  python causal/predict.py --checkpoint runs/causal/<name>/checkpoints/best_epoch.state.pt
 """
 import argparse
 import json
@@ -34,11 +38,11 @@ from causal.train import TrajectoryDataset, collate_pad, _to_device
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description='Causal next-POI prediction')
-    p.add_argument('--checkpoint', type=str, required=True)
+    p = argparse.ArgumentParser(description='因果 next-POI 预测（附录 D.5 双模式）')
+    p.add_argument('--checkpoint', type=str, required=True, help='best_epoch.state.pt 路径')
     p.add_argument('--data-test', type=str, default='dataset/NYC/NYC_test.csv')
     p.add_argument('--data-train', type=str, default='dataset/NYC/NYC_train.csv',
-                   help='Used to rebuild train-based pop / area tables')
+                   help='用来按训练集口径重建热度 / 区域表')
     p.add_argument('--data-node-feats', type=str, default='dataset/NYC/graph_X.csv')
     p.add_argument('--batch', type=int, default=16)
     p.add_argument('--workers', type=int, default=0)
@@ -48,21 +52,25 @@ def parse_args():
     p.add_argument('--feature2', type=str, default='poi_catid')
     p.add_argument('--feature3', type=str, default='latitude')
     p.add_argument('--feature4', type=str, default='longitude')
-    p.add_argument('--output-dir', type=str, default=None)
+    p.add_argument('--output-dir', type=str, default=None, help='默认为该 run 下的 predictions/')
     p.add_argument('--top-k', type=int, default=20)
-    p.add_argument('--no-cuda', action='store_true', default=False)
+    p.add_argument('--no-cuda', action='store_true', default=False, help='强制 CPU')
     p.add_argument('--modes', type=str, default='factual,deconf_pref,deconf_do,deconf_sum',
-                   help='Comma-separated scoring modes (Appendix D.5)')
-    p.add_argument('--max-batches', type=int, default=0)
+                   help='逗号分隔的打分模式，见附录 D.5')
+    p.add_argument('--max-batches', type=int, default=0, help='>0 时只跑前几步（冒烟）')
     return p.parse_args()
 
 
 def rebuild_table(cli, args, poi_id2idx, meta):
+    """预测时重新搭一张和训练时对齐的混杂表。
+
+    距离由经纬度现场算（确定的）；热度档、区域 id、先验频率优先用训练保存的 meta，
+    避免训练 / 预测切分不一致导致 embedding 下标对不上。
+    """
     train_df = pd.read_csv(cli.data_train)
     nodes_df = load_nodes_df(cli.data_node_feats)
     table = build_poi_table(nodes_df, train_df, args, poi_id2idx)
     if meta is not None:
-        # Keep the training-time pop / area / priors so predict matches the ckpt.
         if 'pop' in meta:
             table.pop = meta['pop']
             table.log_pop = np.log1p(table.pop)
@@ -78,7 +86,6 @@ def rebuild_table(cli, args, poi_id2idx, meta):
             table.median_pop_bin = int(meta.get('median_pop_bin', 0))
         else:
             fill_transition_priors(table, [(0, 0)])
-        # Recompute distance tables (deterministic from lat/lon).
         table.lat = meta.get('lat', table.lat)
         table.lon = meta.get('lon', table.lon)
         table.dist_km = pairwise_haversine_km(table.lat, table.lon)
@@ -93,6 +100,7 @@ def rebuild_table(cli, args, poi_id2idx, meta):
 def main():
     cli = parse_args()
     device = torch.device('cpu' if cli.no_cuda or not torch.cuda.is_available() else 'cuda')
+    # torch 2.4 需要 weights_only=False 才能加载里面的 argparse.Namespace；1.7 没有这个参数
     try:
         ckpt = torch.load(cli.checkpoint, map_location=device, weights_only=False)
     except TypeError:
@@ -105,6 +113,7 @@ def main():
     args.feature3 = getattr(args, 'feature3', cli.feature3)
     args.feature4 = getattr(args, 'feature4', cli.feature4)
 
+    # 必须用训练时的 id 映射，否则 embedding 行对不上
     user_id2idx = ckpt['user_id2idx_dict']
     poi_id2idx = ckpt['poi_id2idx_dict']
     cat_id2idx = ckpt['cat_id2idx_dict']
@@ -165,6 +174,7 @@ def main():
                         c_acc[i, L - 1], c_pop[i, L - 1],
                         bool(area[origin] == area[dest]))
 
+            # jsonl：每条轨迹一行，同时记下写实 top-k 和兴趣 top-k，方便肉眼对比
             fact = scores_by_mode.get('factual', scores_by_mode[modes[0]])
             pref = scores_by_mode.get('deconf_pref', None)
             for i, L in enumerate(batch['lengths']):

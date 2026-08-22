@@ -1,8 +1,15 @@
-"""Train the Appendix D causal next-POI model.
+"""训练附录 D 的因果 next-POI 模型。
 
-Running logic follows GETNext (traj CSV → padded batch → Transformer → last-step
-Acc@k / MRR, checkpoint on val score) with causal replacements where the two
-designs conflict: no GCN / NodeAttnMap, C stays out of tokens, dual scores.
+整体流程和 GETNext 几乎一样，方便对照：
+  读轨迹 CSV → 按轨迹做成样本 → 补齐成 batch → 前向算分 → 算损失 → 反向更新
+  → 每个 epoch 在验证集上看 Acc@k / MRR → 存最好的 checkpoint
+
+和 GETNext 不同、按因果规格改掉的部分：
+  - 不用 GCN、不用 NodeAttnMap
+  - 混杂 C 不进 Transformer token
+  - 损失是「总分 CE + 兴趣环带 + 混杂对齐 + 对抗 + 重建」
+  - 验证时同时报 factual（总分）和 deconf（只用兴趣分）两套指标
+    选 checkpoint 只用 factual，避免用去混淆分数去刷写实 Acc（§7）
 """
 import logging
 import os
@@ -20,6 +27,7 @@ import yaml
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+# 保证从仓库根目录也能 import 原来的 utils.py 和 causal.*
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -34,6 +42,8 @@ SEP = '-' * 72
 
 
 class TqdmLoggingHandler(logging.Handler):
+    """日志走 tqdm.write，进度条才不会被 print 打乱（和 GETNext 相同）。"""
+
     def emit(self, record):
         try:
             tqdm.write(self.format(record))
@@ -43,6 +53,7 @@ class TqdmLoggingHandler(logging.Handler):
 
 
 def setup_logger(save_dir, verbose=False):
+    """文件里记全量日志；屏幕默认只显示关键 INFO。"""
     root = logging.getLogger()
     for handler in root.handlers[:]:
         root.removeHandler(handler)
@@ -59,13 +70,20 @@ def setup_logger(save_dir, verbose=False):
 
 
 def resolve_device(args):
+    """有 GPU 且没开 --no-cuda 就用 CUDA，否则 CPU。云端环境是 CPU。"""
     if args.no_cuda or not torch.cuda.is_available():
         return torch.device('cpu')
     return torch.device(args.device)
 
 
 class TrajectoryDataset(Dataset):
-    """GETNext-style next-step pairs, plus category ids needed by the causal aux head."""
+    """把一条签到轨迹切成「用前缀预测下一步」，和 GETNext 相同。
+
+    例：地点 [A, B, C, D]
+      输入 (poi): A, B, C
+      标签 (label_poi): B, C, D
+    评估时只看最后一个时间步（用 A,B,C 预测 D），也和 GETNext 相同。
+    """
 
     def __init__(self, df, poi_id2idx, user_id2idx, poi_idx2cat_idx, time_col,
                  min_len, skip_unknown_user=False):
@@ -74,6 +92,7 @@ class TrajectoryDataset(Dataset):
         n_traj = df['trajectory_id'].nunique()
         for traj_id, traj_df in tqdm(grouped, total=n_traj,
                                       desc='Build trajectories', leave=False, dynamic_ncols=True):
+            # trajectory_id 形如 "470_1"，下划线前面是 user_id
             user_id = str(str(traj_id).split('_')[0])
             if skip_unknown_user and user_id not in user_id2idx:
                 continue
@@ -82,7 +101,7 @@ class TrajectoryDataset(Dataset):
             poi_idxs, times = [], []
             for poi_id, t in zip(traj_df['POI_id'].tolist(), traj_df[time_col].tolist()):
                 if poi_id not in poi_id2idx:
-                    continue
+                    continue  # 验证/测试里出现训练集没见过的地点则跳过该点
                 poi_idxs.append(poi_id2idx[poi_id])
                 times.append(float(t))
             if len(poi_idxs) < min_len + 1:
@@ -112,6 +131,12 @@ class TrajectoryDataset(Dataset):
 
 
 def collate_pad(batch):
+    """把一个 batch 里长短不一的轨迹补齐到相同 T。
+
+    补齐位置：
+      输入填 0（后面用 pad=True 让注意力忽略）
+      标签填 -1（CrossEntropy 的 ignore_index，不算进损失）
+    """
     lengths = [len(s['poi']) for s in batch]
     bsz, tmax = len(batch), max(lengths)
     poi = torch.zeros(bsz, tmax, dtype=torch.long)
@@ -142,6 +167,7 @@ def collate_pad(batch):
 
 
 def masked_mse(pred, target, ignore=-1):
+    """时间回归用：跳过标签为 -1 的补齐位置。"""
     mask = target != ignore
     if mask.sum() == 0:
         return pred.new_zeros(())
@@ -149,7 +175,10 @@ def masked_mse(pred, target, ignore=-1):
 
 
 def gather_c_of_y(origin, y_poi, time_feat, buffers, num_hour_bins):
-    """Discrete C(Y) used by L_adv / L_recon (D.4.4). Pads stay -1."""
+    """取出「真值下一站 Y」上的离散混杂 C，给对抗 / 重建损失用（D.4.4）。
+
+    补齐位置一律写成 -1，后面 CE 会忽略。
+    """
     valid = y_poi >= 0
     safe_o = origin.clamp(min=0)
     safe_y = y_poi.clamp(min=0)
@@ -167,14 +196,26 @@ def gather_c_of_y(origin, y_poi, time_feat, buffers, num_hour_bins):
 
 
 def compute_losses(model, batch, buffers, args, ce):
+    """一次前向：编码 → 打分 → 五项损失（附录 D.4 / 算法 1）。
+
+    L = L_main
+      + λ_pref  * 同距离环带 CE（只在 s_pref 上）
+      + λ_conf  * s_conf 对齐手工先验 g̃
+      + λ_adv   * 用 h_z 猜 C（GRL 已在模型里反转梯度）
+      + λ_recon * 用 h_c 重建 C
+      + λ_cat   * 从 h_z 猜下一站类别（可选）
+      + λ_time  * 时间 MSE（默认权重 0）
+    """
     poi = batch['poi']
     h, h_z, h_c = model.encode(poi, batch['time'], batch['cat'], batch['user'], batch['pad'])
     s, s_pref, s_conf, _ = model.score(h_z, h_c, poi, buffers, mode='factual')
     y = batch['y_poi']
 
+    # D.4.1 主损失：总分 s 做全词表 CE，拟合 P(Y|H,C)
     loss_main = ce(s.transpose(1, 2), y)
 
-    # D.4.2 same-distance-band CE on s_pref only.
+    # D.4.2 兴趣通道：只在「和真值同一距离桶」的地点里做 softmax
+    # 这样模型不能靠「更近」取巧，必须在一样远的集合里比偏好
     c_acc, c_pop, c_area, c_hour = gather_c_of_y(
         poi, y, batch['time'], buffers, args.time_units)
     dist_full = buffers['dist_bin'][poi.clamp(min=0)]
@@ -182,13 +223,16 @@ def compute_losses(model, batch, buffers, args, ce):
     s_ring = s_pref.masked_fill(~ring, torch.tensor(-1e9, device=s_pref.device, dtype=s_pref.dtype))
     loss_pref = ce(s_ring.transpose(1, 2), y)
 
+    # D.4.3 混杂通道：s_conf 去贴「近则高、热则高、同区则高」的手工分（不反传到 g̃）
     g_tilde = model.g_tilde(poi, buffers, args.align_alpha, args.align_beta).detach()
     valid = (y >= 0).unsqueeze(-1).float()
     denom = valid.sum() * s_conf.size(-1)
     loss_conf = (((s_conf - g_tilde) ** 2) * valid).sum() / denom.clamp(min=1.0)
     if args.conf_aux_ce:
+        # 可选：再给 s_conf 一个很弱的 CE；默认关掉，以免混杂通道抢走兴趣信号
         loss_conf = loss_conf + 0.1 * ce(s_conf.transpose(1, 2), y)
 
+    # D.4.4 拆表征：h_z 不该轻易猜中 C；h_c 应该能重建 C
     adv = model.adv_logits(h_z, lambd=1.0)
     recon = model.recon_logits(h_c)
     targets = (c_acc, c_pop, c_area, c_hour)
@@ -216,6 +260,7 @@ def compute_losses(model, batch, buffers, args, ce):
 
 @torch.no_grad()
 def eval_batch_metrics(parts, batch, buffers, meter_fact, meter_deconf):
+    """验证：factual 用总分 s，deconf 用兴趣分 s_pref；只评每条轨迹最后一步。"""
     y_np = batch['y_poi'].detach().cpu().numpy()
     s_np = parts['s'].detach().cpu().numpy()
     pref_np = parts['s_pref'].detach().cpu().numpy()
@@ -234,6 +279,7 @@ def eval_batch_metrics(parts, batch, buffers, meter_fact, meter_deconf):
 
 
 def format_epoch_summary(epoch, total, lr, train_loss, fact, deconf, saved=False, score=None):
+    """每个 epoch 打在屏幕上的一小段摘要。"""
     lines = [
         SEP,
         f' Epoch {epoch + 1:>4d}/{total}  |  lr={lr:.2e}',
@@ -255,6 +301,7 @@ def format_epoch_summary(epoch, total, lr, train_loss, fact, deconf, saved=False
 
 
 def train(args):
+    # ---------- 0. 目录、日志、把本次参数存下来 ----------
     args.device = resolve_device(args)
     args.save_dir = increment_path(Path(args.project) / args.name, exist_ok=args.exist_ok, sep='-')
     os.makedirs(args.save_dir, exist_ok=True)
@@ -274,6 +321,7 @@ def train(args):
     zipdir(ROOT / 'causal', zipf, include_format=['.py'])
     zipf.close()
 
+    # ---------- 1. 读 CSV，建立 id→下标，再算混杂表 C ----------
     logging.info('[1/4] Loading trajectories & POI confounder table...')
     train_df = pd.read_csv(args.data_train)
     val_df = pd.read_csv(args.data_val)
@@ -291,6 +339,7 @@ def train(args):
 
     table = build_poi_table(nodes_df, train_df, args, poi_id2idx)
 
+    # ---------- 2. Dataset / DataLoader（验证集丢掉训练没见过的用户）----------
     logging.info('[2/4] Building dataloaders...')
     train_ds = TrajectoryDataset(
         train_df, poi_id2idx, user_id2idx, poi_idx2cat_idx,
@@ -316,6 +365,7 @@ def train(args):
         val_ds, batch_size=args.batch, shuffle=False, drop_last=False,
         num_workers=args.workers, collate_fn=collate_pad)
 
+    # ---------- 3. 搭模型（没有 GCN）----------
     logging.info('[3/4] Building causal model (no GCN / NodeAttnMap)...')
     model = CausalNextPOI(args, table.num_pois, len(user_id2idx), len(cat_id2idx), table)
     model = model.to(args.device)
@@ -329,6 +379,7 @@ def train(args):
             optimizer, 'min', verbose=False, factor=args.lr_scheduler_factor)
     ce = nn.CrossEntropyLoss(ignore_index=-1)
 
+    # 预测时要按同一套分桶重建距离表，把统计量存下来
     with open(os.path.join(args.save_dir, 'poi_table_meta.pkl'), 'wb') as f:
         pickle.dump({
             'poi_id2idx': poi_id2idx,
@@ -351,6 +402,7 @@ def train(args):
             'num_pop_bins': table.num_pop_bins,
         }, f)
 
+    # ---------- 4. epoch 循环 ----------
     logging.info('[4/4] Start training...')
     max_val_score = -np.inf
     train_hist, val_hist = [], []
@@ -363,7 +415,7 @@ def train(args):
                     leave=False, dynamic_ncols=True)
         for b_idx, batch in enumerate(pbar):
             if args.max_batches and b_idx >= args.max_batches:
-                break
+                break  # 冒烟测试：每个 epoch 只跑前几步
             batch = _to_device(batch, args.device)
             optimizer.zero_grad()
             parts = compute_losses(model, batch, buffers, args, ce)
@@ -390,6 +442,7 @@ def train(args):
             pbar.set_postfix(loss=f'{tr_parts["loss"][-1]:.2f}',
                              top1=f'{tr_parts["top1"][-1]:.3f}', refresh=False)
 
+        # 验证：不算梯度；同时累计 factual / deconf 两套 last-step 指标
         model.eval()
         meter_f, meter_d = SliceMeter(), SliceMeter()
         val_losses = []
@@ -410,8 +463,7 @@ def train(args):
         train_m = {k: float(np.mean(v)) for k, v in tr_parts.items()}
         val_loss = float(np.mean(val_losses)) if val_losses else np.inf
         scheduler.step(val_loss)
-        # Monitor factual Acc@1/Acc@20 like GETNext, but never select ckpt by deconf
-        # scores (Appendix D / §7: do not "刷" factual Acc with deconf ranks).
+        # 和 GETNext 一样用 factual Acc@1/Acc@20 组合分挑最好的模型
         monitor_score = float(fact['top1'] * 4 + fact['top20']) if fact['top1'] is not None else -np.inf
         saved = False
         if args.save_weights and fact['top1'] is not None and monitor_score >= max_val_score:
@@ -449,6 +501,7 @@ def train(args):
 
 
 def _to_device(batch, device):
+    """把 batch 里的 Tensor 搬到 CPU 或 GPU；traj_id 这种字符串保持原样。"""
     out = {}
     for k, v in batch.items():
         if torch.is_tensor(v):
@@ -459,6 +512,7 @@ def _to_device(batch, device):
 
 
 def _write_hist(save_dir, train_hist, val_hist):
+    """每个 epoch 覆盖写入 metrics-train.txt / metrics-val.txt，方便画曲线。"""
     def _dump(path, rows, prefix):
         with open(path, 'w') as f:
             if not rows:
