@@ -1,5 +1,40 @@
 # Causal next-POI (Appendix D)
 
+## 不懂代码时怎么读（建议顺序）
+
+这个文件夹是「因果版 next-POI」，和原来的 GETNext **并排存在**，不会改 `train.py` / `model.py`。
+可以把它想成一条流水线，而不是一堆神秘公式：
+
+1. **用户走过的地点序列**（历史 H）送进 Transformer，得到一个向量 `h`（“读完这条轨迹后的摘要”）。
+2. 把 `h` **拆成两份**：`h_z` 尽量只表示兴趣，`h_c` 尽量表示近/热/区等混杂。
+3. 对每个候选地点打两个分再相加：`s = 兴趣分 s_pref + 混杂分 s_conf`。
+4. 训练时：总分要能猜对下一站；兴趣分要在「一样远」的地点里比出偏好；混杂分要去学距离/热度；并且 `h_z` 不该轻易猜出混杂。
+5. 预测时出两套榜：**factual**（真实约束下下一站）和 **deconf**（把近/热拿掉后兴趣指向谁）。
+
+对应文件（从上到下读即可）：
+
+| 文件 | 人话 |
+|------|------|
+| `param_parser.py` | 命令行开关：学多久、batch 多大、几项损失的权重 |
+| `features.py` | 事先算好每个地点的距离桶、热度桶、区域 id（混杂 C） |
+| `model.py` | 网络结构：编码 → 拆 `h_z/h_c` → 两个分数 |
+| `train.py` | 训练循环，和 GETNext 很像：读 CSV → 按 batch 更新 → 存最好的模型 |
+| `predict.py` | 加载模型，打出 factual / deconf 两套 top-k |
+| `metrics.py` | Acc@k、MRR，以及按距离/热度/是否跨区切开的指标 |
+| `run_cpu_smoke.sh` | CPU 上跑几步，确认能跑通 |
+
+代码里的注释用中文写了「这一段在干什么、对应附录 D 哪一节」。符号对照：
+
+- `H` / `poi`：历史轨迹（当前已访问的地点序列）
+- `Y` / `y_poi`：下一站真值
+- `C`：混杂（距离 `c_acc`、热度 `c_pop`、区域 `c_area`、时刻 `c_hour`）
+- `h_z`：兴趣代理；`h_c`：混杂摘要
+- `s_pref`：兴趣通道；`s_conf`：混杂通道；`s = s_pref + s_conf`
+
+---
+
+## English / 运行说明
+
 This folder is a **standalone** implementation of
 `docs/causal-nextpoi-thinking.md` **Appendix D**
 (score decomposition §5.1 + dual representation / back-door training §5.2).
