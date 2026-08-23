@@ -63,7 +63,41 @@
 - `Y` / `y_poi`：下一站真值
 - `C`：混杂（距离 `c_acc`、热度 `c_pop`、区域 `c_area`、时刻 `c_hour`）
 - `h_z`：兴趣代理；`h_c`：混杂摘要
-- `s_pref`：兴趣通道；`s_conf`：混杂通道；`s = s_pref + s_conf`
+- `s_pref`：兴趣通道；`s_conf`：混杂通道
+- 总分：`s = w_pref * s_pref + w_conf * s_conf`（默认两个权重都是 1，等于附录 D 的直接相加）
+- `s_conf` 内部：`w_acc * 距离 + w_pop * 热度 + w_area * 区域 + w_ctx * 情境`（默认也全是 1）
+
+### 分数权重：加了超参，但不要六个一起搜
+
+现在可以调，但 **默认全部 = 1，和改之前一模一样**。
+
+| 开关 | 作用 | 建议 |
+|------|------|------|
+| `--w-pref` | 兴趣通道在总分里的音量 | 保持 1 |
+| `--w-conf` | 混杂通道在总分里的音量 | **唯一建议搜索的**，例如 `{0.25, 0.5, 1, 2}` |
+| `--w-acc` / `--w-pop` / `--w-area` / `--w-ctx` | `s_conf` 里四项谁更响 | 训练保持 1；设 0 做消融 |
+
+为什么不用网格搜这 6 个：
+
+1. **`g_acc` / `g_pop` / `g_area` 已经是可学习的尺度**（查表分、线性层）。训练时 `L_conf` 会把它们推向手工先验 `g̃`。再搜内部权重，多半和这些层互相抵消。
+2. **`s_pref` 和 `s_conf` 的相对强弱** 才是一个自由度。只调 `--w-conf` 就够：写实榜太偏「近/热」就略降；混杂通道太弱、factual 几乎等于 deconf 就略升。
+3. **更好的办法：训练用默认 1，预测时再扫 `--w-conf`，不必重训。**
+
+```bash
+# 同一份 checkpoint，只改混杂音量
+python causal/predict.py --checkpoint ... --w-conf 0.5 --no-cuda
+python causal/predict.py --checkpoint ... --w-conf 1.0 --no-cuda
+python causal/predict.py --checkpoint ... --w-conf 2.0 --no-cuda
+```
+
+消融（预测时关掉某一项，看 Acc 掉多少）：
+
+```bash
+python causal/predict.py --checkpoint ... --w-acc 0 --no-cuda   # 不要距离
+python causal/predict.py --checkpoint ... --w-pop 0 --no-cuda   # 不要热度
+```
+
+`lambda_*`（损失权重）和 `w_*`（分数音量）不是一回事：前者管训练时哪项 loss 更用力，后者管打分时哪路更响。
 
 ---
 
@@ -92,7 +126,8 @@ CSV trajectories
     → Transformer encoder (causal mask)
     → split h → (h_z, h_c)
     → s_pref = <h_z, e_p>
-    → s_conf = g_acc + g_pop + g_area + <W_c h_c, ψ(p)>
+    → s_conf = w_acc g_acc + w_pop g_pop + w_area g_area + w_ctx <W_c h_c, ψ(p)>
+    → s = w_pref s_pref + w_conf s_conf     # defaults all 1 (Appendix D)
     → L = L_main + λ_pref L_pref + λ_conf L_conf + λ_adv L_adv + λ_recon L_recon
 ```
 
@@ -184,7 +219,7 @@ GPU: drop `--no-cuda`.
 
 | Mode | Score | Question |
 |------|--------|----------|
-| `factual` | `s_pref + s_conf` with real `C(p)` | next hop under real constraints |
+| `factual` | `w_pref s_pref + w_conf s_conf` with real `C(p)` | next hop under real constraints |
 | `deconf_pref` | `s_pref` only | preferred `do(C)` interest ranking |
 | `deconf_do` | `s_pref + s_conf(φ̄)` | access/pop replaced by training-mode buckets |
 | `deconf_sum` | mix `g_acc` / `g_pop` over `P̂(c)` | cheap back-door marginalisation |

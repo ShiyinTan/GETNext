@@ -164,6 +164,7 @@ class CausalNextPOI(nn.Module):
               psi.weight: (N, d_c)
               adv_*: d_z → K/P/A/H ； recon_*: d_c → K/P/A/H
               cat_head: d_z → n_cat ； time_head: d → 1
+              w_pref / w_conf / w_acc / w_pop / w_area / w_ctx: 标量，默认 1
         """
         super().__init__()
         self.num_pois = num_pois
@@ -230,6 +231,25 @@ class CausalNextPOI(nn.Module):
         nn.init.zeros_(self.g_pop.bias)
         nn.init.zeros_(self.g_area.weight)
         nn.init.zeros_(self.g_area.bias)
+
+        # 分数怎么加：附录 D 是直接相加。这里加可调权重，默认全是 1，行为不变。
+        # g_acc / g_pop / g_area 自己已有可学的尺度，所以内部四项默认不要网格搜索。
+        self.apply_score_weights(args)
+
+    def apply_score_weights(self, args):
+        """从 args 读分数权重。缺省（旧 checkpoint）一律当 1。
+
+        输入:
+            args: 有 w_pref / w_conf / w_acc / w_pop / w_area / w_ctx 的对象
+        输出:
+            无返回。写入 self 上的 6 个标量 float。
+        """
+        self.w_pref = float(getattr(args, 'w_pref', 1.0))
+        self.w_conf = float(getattr(args, 'w_conf', 1.0))
+        self.w_acc = float(getattr(args, 'w_acc', 1.0))
+        self.w_pop = float(getattr(args, 'w_pop', 1.0))
+        self.w_area = float(getattr(args, 'w_area', 1.0))
+        self.w_ctx = float(getattr(args, 'w_ctx', 1.0))
 
     def _token_embed(self, poi_idx, time_feat, cat_idx, user_idx):
         """把一步的 (地点, 时间, 类别, 用户) 融合成 Transformer 的一个 token。
@@ -326,7 +346,11 @@ class CausalNextPOI(nn.Module):
         return dist_bin, dist_km, origin_area
 
     def _s_conf_from_phi(self, h_c, dist_bin, origin_area, buffers):
-        """混杂通道：s_conf = 距离分 + 热度分 + 区域分 + h_c 匹配分。
+        """混杂通道：四项先各自算出，再按 w_acc / w_pop / w_area / w_ctx 加权求和。
+
+        默认权重全是 1，等于附录 D 的直接相加。
+        返回的 s_conf 已经乘过内部权重；parts 里仍是未加权的原始项，
+        方便 deconf_do 替换热度后再 mix 一次。
 
         输入:
             h_c:         (B, T, d_c)
@@ -352,12 +376,33 @@ class CausalNextPOI(nn.Module):
         s_area = self.g_area(area_match.unsqueeze(-1)).squeeze(-1)
         ctx = torch.matmul(self.W_c(h_c), self.psi.weight.transpose(0, 1))
         s_pop_b = s_pop.view(1, 1, -1)
-        return s_acc + s_pop_b + s_area + ctx, {
+        parts = {
             's_acc': s_acc,
             's_pop': s_pop_b,
             's_area': s_area,
             's_ctx': ctx,
         }
+        return self._mix_s_conf(parts), parts
+
+    def _mix_s_conf(self, parts):
+        """s_conf = w_acc*距离 + w_pop*热度 + w_area*区域 + w_ctx*情境。默认权重全是 1。
+
+        输入:
+            parts: dict，未乘权重的四项，形状见 _s_conf_from_phi
+        输出:
+            s_conf: (B, T, N)
+        """
+        return (self.w_acc * parts['s_acc']
+                + self.w_pop * parts['s_pop']
+                + self.w_area * parts['s_area']
+                + self.w_ctx * parts['s_ctx'])
+
+    def _combine_scores(self, s_pref, s_conf):
+        """总分 s = w_pref * s_pref + w_conf * s_conf。默认都是 1。
+
+        输入 / 输出: 均为 (B, T, N)
+        """
+        return self.w_pref * s_pref + self.w_conf * s_conf
 
     def score(self, h_z, h_c, origin_idx, buffers, mode='factual',
               bar_acc_bin=None, bar_pop_log=None):
@@ -371,9 +416,9 @@ class CausalNextPOI(nn.Module):
             mode:       str
             bar_acc_bin / bar_pop_log: do(C) 用的标量干预值
         输出:
-            s:      (B, T, N)  用来排序的总分
-            s_pref: (B, T, N)
-            s_conf: (B, T, N)
+            s:      (B, T, N)  w_pref * s_pref + w_conf * s_conf，用来排序
+            s_pref: (B, T, N)  未乘 w_pref（L_pref 仍用原始兴趣分）
+            s_conf: (B, T, N)  已乘内部四项权重
             dist_km:(B, T, N)  真实公里数（评估切片用，不受 mode 改写）
 
         mode 含义（人话）：
@@ -387,7 +432,7 @@ class CausalNextPOI(nn.Module):
 
         if mode == 'deconf_pref':
             s_conf = torch.zeros_like(s_pref)
-            return s_pref, s_pref, s_conf, dist_km
+            return self._combine_scores(s_pref, s_conf), s_pref, s_conf, dist_km
 
         if mode == 'deconf_do':
             # do(C=c_bar)：每个候选都用同一个距离桶，热度换成常数
@@ -395,25 +440,27 @@ class CausalNextPOI(nn.Module):
             if bar_acc_bin is None:
                 bar_acc_bin = 0
             dist_bin = torch.full_like(dist_bin, int(bar_acc_bin))
-            s_conf, parts = self._s_conf_from_phi(h_c, dist_bin, origin_area, buffers)
+            _, parts = self._s_conf_from_phi(h_c, dist_bin, origin_area, buffers)
             if bar_pop_log is None:
                 pop_const = self.g_pop(buffers['log_pop'].mean().view(1, 1)).view(1, 1, 1)
             else:
                 pop_const = self.g_pop(
                     torch.tensor([[float(bar_pop_log)]], device=h_z.device, dtype=h_z.dtype)
                 ).view(1, 1, 1)
-            s_conf = s_conf - parts['s_pop'] + pop_const
-            return s_pref + s_conf, s_pref, s_conf, dist_km
+            parts = dict(parts)
+            parts['s_pop'] = pop_const.expand_as(parts['s_pop'])
+            s_conf = self._mix_s_conf(parts)
+            return self._combine_scores(s_pref, s_conf), s_pref, s_conf, dist_km
 
         if mode == 'deconf_sum':
             # 若给所有候选同一个 g_acc / 平均 g_pop，名次不变，等价于丢掉这两项
             _, parts = self._s_conf_from_phi(h_c, dist_bin, origin_area, buffers)
-            s_conf = parts['s_area'] + parts['s_ctx']
-            return s_pref + s_conf, s_pref, s_conf, dist_km
+            s_conf = self.w_area * parts['s_area'] + self.w_ctx * parts['s_ctx']
+            return self._combine_scores(s_pref, s_conf), s_pref, s_conf, dist_km
 
         # factual：真实 C(p)
         s_conf, _ = self._s_conf_from_phi(h_c, dist_bin, origin_area, buffers)
-        return s_pref + s_conf, s_pref, s_conf, dist_km
+        return self._combine_scores(s_pref, s_conf), s_pref, s_conf, dist_km
 
     def g_tilde(self, origin_idx, buffers, alpha, beta):
         """手工先验混杂分 g̃（附录 D.4.3，训练时 stop-grad）。
