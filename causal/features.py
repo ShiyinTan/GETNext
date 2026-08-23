@@ -184,10 +184,10 @@ def build_poi_table(nodes_df, train_df, args, poi_id2idx):
     也不用轨迹流图 graph_A.csv（附录 A：GCN 会把热度/近邻再灌一遍）。
 
     输入:
-        nodes_df: DataFrame，行数 ≈ N（graph_X.csv）
-        train_df: DataFrame，训练集签到
+        nodes_df: DataFrame = graph_X.csv，一行一个 POI，见 train.py 文件头
+        train_df: DataFrame = NYC_train.csv，一行一次签到，用来数每个 POI 的训练集热度
         args: 超参（dist_bins / pop_bins / area_grid_deg 等标量）
-        poi_id2idx: dict，POI_id → 0..N-1
+        poi_id2idx: dict，POI 字符串 id → 0..N-1（与 nodes_df 行序一致）
     输出:
         PoiConfounderTable，主要数组：
           lat/lon/pop/log_pop/area_id/pop_bin: (N,)
@@ -299,8 +299,11 @@ def load_nodes_df(path):
     """读取 GETNext 的 graph_X.csv（地点 id、类别、经纬度等），不是邻接矩阵。
 
     输入:
-        path: str
+        path: str，默认 dataset/NYC/graph_X.csv
     输出:
-        DataFrame，行数 ≈ N，列含 node_name/poi_id、checkin_cnt、poi_catid、latitude、longitude
+        DataFrame，NYC 约 4980 行，列：
+          node_name/poi_id, checkin_cnt, poi_catid, poi_catid_code,
+          poi_catname, latitude, longitude
+        一行一个 POI；行顺序 = 模型 embedding 下标 0..N-1。
     """
     return pd.read_csv(path)
