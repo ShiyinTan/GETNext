@@ -15,6 +15,34 @@
 collate 之后一个 batch 的关键 tensor：
   poi/cat (B,T)  time (B,T)  user (B,)  pad (B,T) bool
   y_poi/y_cat (B,T)  pad 处为 -1 ； y_time (B,T) pad 处为 -1.0
+
+读进来的表长什么样（NYC，和 GETNext 同一套 CSV）
+----------------------------------------------
+train_df / val_df = 签到明细，一行一次 check-in，不是一条轨迹一行。
+  文件: dataset/NYC/NYC_train.csv （约 8.3 万行 / 1.1 万条轨迹 / 1047 用户）
+        dataset/NYC/NYC_val.csv
+  本文件真正用到的列：
+    user_id            整数，如 470
+    POI_id             Foursquare 字符串 id，如 '49bbd6c0f964a520f4531fe3'
+    trajectory_id      '{user_id}_{第几段}'，如 '470_1'；同一 id 的多行按时间排成一条轨迹
+    norm_in_day_time   [0, 1]，一天里的时刻（0.583 ≈ 下午 2 点）；列名由 --time-feature 指定
+  CSV 里还有但这里不用：POI_catid / latitude / longitude / UTC_time / local_time …
+    （类别和经纬度改从 nodes_df 取，保证和词表下标对齐）
+
+  同一条轨迹的几行（示意）：
+    user_id  POI_id                        norm_in_day_time  trajectory_id
+    1000     4fbfe16ae4b0...               0.50              1000_16
+    1000     4a513b17f964...               0.33              1000_16
+    1000     42911d00f964...               0.35              1000_16
+    1000     42911d00f964...               0.67              1000_16
+  → Dataset 切成 输入 poi=[p0,p1,p2]  标签 y=[p1,p2,p3]
+
+nodes_df = 地点表，一行一个 POI，行顺序就是模型里的下标 0..N-1。
+  文件: dataset/NYC/graph_X.csv （NYC 约 4980 行，不是邻接矩阵；邻接矩阵 graph_A.csv 这里不用）
+    node_name/poi_id   和 train_df['POI_id'] 同一套字符串
+    checkin_cnt        兜底热度；有训练集时会被 train 里的次数覆盖
+    poi_catid          类别字符串，如 '4bf58dd8d48988d11d941735'（约 300 类）
+    latitude / longitude
 """
 import logging
 import os
@@ -101,6 +129,9 @@ def resolve_device(args):
 class TrajectoryDataset(Dataset):
     """把一条签到轨迹切成「用前缀预测下一步」，和 GETNext 相同。
 
+    输入 df 是签到明细（train_df / val_df），按 trajectory_id 分组。
+    每组多行 = 同一条轨迹上按时间排列的若干次 check-in。
+
     例：地点 [A, B, C, D]
       输入 (poi): A, B, C
       标签 (label_poi): B, C, D
@@ -111,15 +142,24 @@ class TrajectoryDataset(Dataset):
                  min_len, skip_unknown_user=False):
         """
         输入:
-            df: DataFrame，签到行
-            poi_id2idx / user_id2idx / poi_idx2cat_idx: dict，id → 下标
+            df: DataFrame，签到行。用到的列：
+                trajectory_id, POI_id, time_col（默认 norm_in_day_time）
+                用户从 trajectory_id 的下划线前半段解析，如 '470_1' → user '470'
+            poi_id2idx: {原始 POI 字符串: 0..N-1}，来自 nodes_df 行序
+            user_id2idx: {用户字符串: 0..n_user-1}，只含训练集出现过的用户
+            poi_idx2cat_idx: {POI 下标: 类别下标}，来自 nodes_df['poi_catid']
             time_col: str
-            min_len: int，输入前缀最短长度
-            skip_unknown_user: bool
+            min_len: int，输入前缀最短长度（默认 2，所以原始轨迹至少 3 个点）
+            skip_unknown_user: bool，验证/测试时丢掉训练没见过的用户
         输出:
-            无返回。self.samples: list[dict]，每条样本是 Python list，还不是 tensor：
-              poi / cat / time / label_poi / label_time / label_cat: 长度 T_i
-              user_idx: int ； traj_id: str
+            无返回。self.samples: list[dict]，还不是 tensor。一条样本一例：
+              traj_id='1000_16'  user_idx=3
+              poi=[12, 45, 7]          # 长度 T_i，已映射成 0..N-1
+              cat=[2, 8, 8]
+              time=[0.50, 0.33, 0.35]  # 与 poi 对齐的日内时刻
+              label_poi=[45, 7, 7]     # 下一步地点
+              label_cat=[8, 8, 8]
+              label_time=[0.33, 0.35, 0.67]
         """
         self.samples = []
         grouped = df.groupby('trajectory_id', sort=False)
@@ -446,19 +486,24 @@ def train(args):
 
     # ---------- 1. 读 CSV，建立 id→下标，再算混杂表 C ----------
     logging.info('[1/4] Loading trajectories & POI confounder table...')
+    # 签到明细：一行一次 check-in。NYC_train 约 8.3 万行，列见文件头注释。
     train_df = pd.read_csv(args.data_train)
     val_df = pd.read_csv(args.data_val)
+    # 地点表 graph_X.csv：一行一个 POI。NYC 约 4980 行 ×
+    #   node_name/poi_id, checkin_cnt, poi_catid, poi_catid_code, poi_catname, latitude, longitude
     nodes_df = load_nodes_df(args.data_node_feats)
 
+    # 词表下标必须和 Embedding 行对齐。POI 按下表行序 0..N-1，不要按字符串排序。
     poi_ids = list(nodes_df['node_name/poi_id'].tolist())
-    poi_id2idx = dict(zip(poi_ids, range(len(poi_ids))))
-    cat_ids = list(dict.fromkeys(nodes_df[args.feature2].tolist()))
-    cat_id2idx = dict(zip(cat_ids, range(len(cat_ids))))
+    poi_id2idx = dict(zip(poi_ids, range(len(poi_ids))))  # '49bbd6c0…' → 17
+    cat_ids = list(dict.fromkeys(nodes_df[args.feature2].tolist()))  # 出现顺序，NYC ~313 类
+    cat_id2idx = dict(zip(cat_ids, range(len(cat_ids))))  # '4bf58dd8…d11d941735' → 0
     poi_idx2cat_idx = {}
     for _, row in nodes_df.iterrows():
         poi_idx2cat_idx[poi_id2idx[row['node_name/poi_id']]] = cat_id2idx[row[args.feature2]]
+    # 用户词表只用训练集，验证集里没见过的用户后面会丢掉
     user_ids = [str(u) for u in sorted(set(train_df['user_id'].astype(str).tolist()))]
-    user_id2idx = dict(zip(user_ids, range(len(user_ids))))
+    user_id2idx = dict(zip(user_ids, range(len(user_ids))))  # '470' → 12；NYC 训练集约 1047 人
 
     table = build_poi_table(nodes_df, train_df, args, poi_id2idx)
 
@@ -474,7 +519,7 @@ def train(args):
     train_pairs = []
     for s in train_ds.samples:
         for o, d in zip(s['poi'], s['label_poi']):
-            train_pairs.append((o, d))
+            train_pairs.append((o, d))  # 都是 0..N-1 的 POI 下标，不是原始字符串 id
     fill_transition_priors(table, train_pairs)
 
     logging.info(f'        POIs={table.num_pois} cats={len(cat_id2idx)} users={len(user_id2idx)} '
