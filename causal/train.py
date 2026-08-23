@@ -316,6 +316,7 @@ def compute_losses(model, batch, buffers, args, ce):
     g_tilde = model.g_tilde(poi, buffers, args.align_alpha, args.align_beta).detach()
     valid = (y >= 0).unsqueeze(-1).float()
     denom = valid.sum() * s_conf.size(-1)
+    # 对齐的是打分用的 s_conf（已含内部 w_*）。训练时内部权重请保持 1，以免和 g_* 对打。
     loss_conf = (((s_conf - g_tilde) ** 2) * valid).sum() / denom.clamp(min=1.0)
     if args.conf_aux_ce:
         # 可选：再给 s_conf 一个很弱的 CE；默认关掉，以免混杂通道抢走兴趣信号
@@ -433,6 +434,8 @@ def train(args):
     logging.info(f' epochs   : {args.epochs}  batch={args.batch}  lr={args.lr}')
     logging.info(f' lambdas  : pref={args.lambda_pref} conf={args.lambda_conf} '
                  f'adv={args.lambda_adv} recon={args.lambda_recon}')
+    logging.info(f' score w  : pref={args.w_pref} conf={args.w_conf} '
+                 f'acc={args.w_acc} pop={args.w_pop} area={args.w_area} ctx={args.w_ctx}')
     logging.info(SEP)
     with open(os.path.join(args.save_dir, 'args.yaml'), 'w') as f:
         yaml.dump({k: (str(v) if k == 'device' else v) for k, v in vars(args).items()},

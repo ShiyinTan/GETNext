@@ -66,6 +66,14 @@ def parse_args():
     p.add_argument('--modes', type=str, default='factual,deconf_pref,deconf_do,deconf_sum',
                    help='逗号分隔的打分模式，见附录 D.5')
     p.add_argument('--max-batches', type=int, default=0, help='>0 时只跑前几步（冒烟）')
+    p.add_argument('--w-pref', type=float, default=None,
+                   help='覆盖 checkpoint 的兴趣通道权重；不设则用训练时的值')
+    p.add_argument('--w-conf', type=float, default=None,
+                   help='覆盖混杂通道权重。训练完只扫这一个即可，不必重训')
+    p.add_argument('--w-acc', type=float, default=None, help='覆盖 s_conf 距离项权重')
+    p.add_argument('--w-pop', type=float, default=None, help='覆盖 s_conf 热度项权重')
+    p.add_argument('--w-area', type=float, default=None, help='覆盖 s_conf 区域项权重')
+    p.add_argument('--w-ctx', type=float, default=None, help='覆盖 s_conf 情境项权重')
     return p.parse_args()
 
 
@@ -142,6 +150,13 @@ def main():
     args.feature2 = getattr(args, 'feature2', cli.feature2)
     args.feature3 = getattr(args, 'feature3', cli.feature3)
     args.feature4 = getattr(args, 'feature4', cli.feature4)
+    # 预测时可以覆盖分数权重，不必重训。没传的开关保持 checkpoint 里的值（旧 ckpt 缺省为 1）。
+    for key in ('w_pref', 'w_conf', 'w_acc', 'w_pop', 'w_area', 'w_ctx'):
+        override = getattr(cli, key)
+        if override is not None:
+            setattr(args, key, override)
+        elif not hasattr(args, key):
+            setattr(args, key, 1.0)
 
     # 必须用训练时的 id 映射，否则 embedding 行对不上
     user_id2idx = ckpt['user_id2idx_dict']
@@ -231,6 +246,11 @@ def main():
         'data_test': cli.data_test,
         'device': str(device),
         'epoch': ckpt.get('epoch'),
+        'score_weights': {
+            'w_pref': float(args.w_pref), 'w_conf': float(args.w_conf),
+            'w_acc': float(args.w_acc), 'w_pop': float(args.w_pop),
+            'w_area': float(args.w_area), 'w_ctx': float(args.w_ctx),
+        },
         'modes': {m: meters[m].summary() for m in modes},
     }
     out_dir = cli.output_dir or str(Path(cli.checkpoint).resolve().parents[1] / 'predictions')

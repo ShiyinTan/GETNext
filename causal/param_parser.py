@@ -102,6 +102,21 @@ def parameter_parser():
     parser.add_argument('--align-beta', type=float, default=0.3,
                         help='手工先验：+beta × log(1+热度)，把流行度推进混杂通道')
 
+    # ---- 分数怎么加：默认全 1 = 附录 D 直接相加。不要六个一起网格搜索 ----
+    # 真正值得调的通常只有 --w-conf。内部四项给消融 / 预测时微调用。
+    parser.add_argument('--w-pref', type=float, default=1.0,
+                        help='总分里兴趣通道权重：s = w_pref*s_pref + w_conf*s_conf')
+    parser.add_argument('--w-conf', type=float, default=1.0,
+                        help='总分里混杂通道权重。写实榜太偏近/热就略小于 1；不必和内部四项一起搜')
+    parser.add_argument('--w-acc', type=float, default=1.0,
+                        help='s_conf 里距离项权重。设 0 = 消融距离；训练请保持 1')
+    parser.add_argument('--w-pop', type=float, default=1.0,
+                        help='s_conf 里热度项权重。设 0 = 消融热度；训练请保持 1')
+    parser.add_argument('--w-area', type=float, default=1.0,
+                        help='s_conf 里区域项权重。设 0 = 消融区域')
+    parser.add_argument('--w-ctx', type=float, default=1.0,
+                        help='s_conf 里 <W_c h_c, ψ(p)> 情境项权重。设 0 = 消融情境头')
+
     # ---- 训练超参（含义和 GETNext 相同）----
     parser.add_argument('--batch', type=int, default=20, help='一个 batch 几条轨迹')
     parser.add_argument('--epochs', type=int, default=200, help='训练多少轮')
