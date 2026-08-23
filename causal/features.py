@@ -14,6 +14,8 @@
   复现同样的特征，所以这里做成 (起点, 终点) 的大表。
 
 本文件不训练网络，只准备查找表，给 model.py / train.py 用。
+
+形状记号：N=POI 数；K=距离桶；P=热度档；A=区域数；H=时刻桶。
 """
 from dataclasses import dataclass, field
 
@@ -23,7 +25,13 @@ import torch
 
 
 def parse_dist_edges(dist_bins_str):
-    """把命令行字符串 '0.5,1,2,5,10' 变成公里切分点。最后一档默认是「更远」。"""
+    """把命令行字符串 '0.5,1,2,5,10' 变成公里切分点。最后一档默认是「更远」。
+
+    输入:
+        dist_bins_str: str，例如 '0.5,1,2,5,10'
+    输出:
+        edges: (n_edges,) float64 numpy，n_edges 通常是 5
+    """
     edges = [float(x.strip()) for x in dist_bins_str.split(',') if x.strip()]
     if not edges:
         raise ValueError('dist-bins must contain at least one edge')
@@ -33,8 +41,11 @@ def parse_dist_edges(dist_bins_str):
 def pairwise_haversine_km(lat, lon):
     """地球表面两点距离（公里），一次性算完所有 POI 对。
 
-    输入 lat/lon: 每个地点一个经纬度，长度 N
-    输出: (N, N) 矩阵，第 (i,j) 格 = 从地点 i 到地点 j 的公里数
+    输入:
+        lat: (N,) 纬度
+        lon: (N,) 经度
+    输出:
+        (N, N) float64，第 (i,j) 格 = 从地点 i 到地点 j 的公里数
     """
     lat = np.asarray(lat, dtype=np.float64)
     lon = np.asarray(lon, dtype=np.float64)
@@ -49,12 +60,26 @@ def pairwise_haversine_km(lat, lon):
 
 
 def bucketize(values, edges):
-    """连续值 → 整数桶号。例如距离 0.3km 落在第 0 档，8km 落在较后的档。"""
+    """连续值 → 整数桶号。例如距离 0.3km 落在第 0 档，8km 落在较后的档。
+
+    输入:
+        values: 任意形状，例如 dist_km (N, N) 或 pop (N,)
+        edges:  (n_edges,) 切分点
+    输出:
+        与 values 同形状的 int64 桶号
+    """
     return np.digitize(values, edges, right=True).astype(np.int64)
 
 
 def quantile_edges(values, n_bins):
-    """按分位数切热度档，让「很冷 / 较冷 / 较热 / 很热」样本数量差不多（附录 D.8）。"""
+    """按分位数切热度档，让「很冷 / 较冷 / 较热 / 很热」样本数量差不多（附录 D.8）。
+
+    输入:
+        values: (M,) 例如非零热度
+        n_bins: int = P，想切成几档
+    输出:
+        edges: (≤ P-1,) float64，去重后的分位切分点；n_bins<2 时为空数组
+    """
     if n_bins < 2:
         return np.array([], dtype=np.float64)
     qs = np.linspace(0, 100, n_bins + 1)[1:-1]
@@ -63,7 +88,15 @@ def quantile_edges(values, n_bins):
 
 
 def area_id_from_latlon(lat, lon, lat_min, lon_min, grid_deg, n_lon):
-    """把经纬度投到网格上，得到区域整数 id（类似把城市切成棋盘格子）。"""
+    """把经纬度投到网格上，得到区域整数 id（类似把城市切成棋盘格子）。
+
+    输入:
+        lat, lon: (N,)
+        lat_min, lon_min, grid_deg: 标量
+        n_lon: int，经度方向格子数
+    输出:
+        (N,) int64 区域 id（压缩编号之前）
+    """
     lat_bin = np.floor((lat - lat_min) / grid_deg).astype(np.int64)
     lon_bin = np.floor((lon - lon_min) / grid_deg).astype(np.int64)
     lat_bin = np.clip(lat_bin, 0, None)
@@ -73,7 +106,15 @@ def area_id_from_latlon(lat, lon, lat_min, lon_min, grid_deg, n_lon):
 
 @dataclass
 class PoiConfounderTable:
-    """全体 POI 共用的一张「混杂属性表」。下标就是模型里的 POI 编号 0..N-1。"""
+    """全体 POI 共用的一张「混杂属性表」。下标就是模型里的 POI 编号 0..N-1。
+
+    字段形状:
+        lat / lon / pop / log_pop / area_id / pop_bin: (N,)
+        dist_km / dist_bin: (N, N)
+        dist_edges: (n_edges,)  pop_edges: (≤ P-1,)
+        acc_prior: (K,)  pop_prior: (P,)  填完 fill_transition_priors 之后才有
+        其余 num_* / lat_min 等: 标量
+    """
     num_pois: int
     lat: np.ndarray
     lon: np.ndarray
@@ -100,13 +141,31 @@ class PoiConfounderTable:
     median_pop_bin: int = 0
 
     def hour_bin(self, norm_in_day_time):
-        """GETNext 的时间特征在 [0,1]（一天里的比例）→ 时刻桶 0..47（默认半小时一档）。"""
+        """GETNext 的时间特征在 [0,1]（一天里的比例）→ 时刻桶 0..47（默认半小时一档）。
+
+        输入:
+            norm_in_day_time: 任意形状 float，常见 (B, T) 或 (T,)
+        输出:
+            与输入同形状的 int64，取值 0 .. H-1
+        """
         t = np.asarray(norm_in_day_time, dtype=np.float64)
         b = np.floor(np.clip(t, 0.0, 0.999999) * self.num_hour_bins).astype(np.int64)
         return b
 
     def to_torch(self, device):
-        """把前向计算要用的大表搬到 CPU 或 GPU，避免训练时反复拷贝。"""
+        """把前向计算要用的大表搬到 CPU 或 GPU，避免训练时反复拷贝。
+
+        输入:
+            device: torch.device
+        输出: dict
+            dist_bin:  (N, N) long
+            dist_km:   (N, N) float32
+            log_pop:   (N,)   float32
+            pop_bin:   (N,)   long
+            area_id:   (N,)   long
+            acc_prior: (K,)   float32
+            pop_prior: (P,)   float32
+        """
         return {
             'dist_bin': torch.from_numpy(self.dist_bin).to(device=device, dtype=torch.long),
             'dist_km': torch.from_numpy(self.dist_km.astype(np.float32)).to(device),
@@ -123,6 +182,17 @@ def build_poi_table(nodes_df, train_df, args, poi_id2idx):
 
     热度只用「训练集」次数，不用验证/测试里的未来签到，避免 C_pop 泄漏。
     也不用轨迹流图 graph_A.csv（附录 A：GCN 会把热度/近邻再灌一遍）。
+
+    输入:
+        nodes_df: DataFrame，行数 ≈ N（graph_X.csv）
+        train_df: DataFrame，训练集签到
+        args: 超参（dist_bins / pop_bins / area_grid_deg 等标量）
+        poi_id2idx: dict，POI_id → 0..N-1
+    输出:
+        PoiConfounderTable，主要数组：
+          lat/lon/pop/log_pop/area_id/pop_bin: (N,)
+          dist_km / dist_bin: (N, N)
+        此时 acc_prior / pop_prior 还是 None，要等 fill_transition_priors
     """
     num_pois = len(poi_id2idx)
     lat = np.zeros(num_pois, dtype=np.float64)
@@ -200,7 +270,16 @@ def build_poi_table(nodes_df, train_df, args, poi_id2idx):
 
 
 def fill_transition_priors(table, train_pairs):
-    """统计训练集「下一跳」落在各距离桶 / 热度档的比例 hat P(c)（附录 D.5 边缘化要用）。"""
+    """统计训练集「下一跳」落在各距离桶 / 热度档的比例 hat P(c)（附录 D.5 边缘化要用）。
+
+    输入:
+        table: PoiConfounderTable
+        train_pairs: list[(origin, dest)]，长度 = 训练轨迹里有效的下一步数
+    输出:
+        同一个 table（原地写入）
+          acc_prior: (K,)  pop_prior: (P,)
+          median_acc_bin / median_pop_bin: 标量 int
+    """
     acc_counts = np.zeros(table.num_acc_bins, dtype=np.float64)
     pop_counts = np.zeros(table.num_pop_bins, dtype=np.float64)
     for origin, dest in train_pairs:
@@ -217,5 +296,11 @@ def fill_transition_priors(table, train_pairs):
 
 
 def load_nodes_df(path):
-    """读取 GETNext 的 graph_X.csv（地点 id、类别、经纬度等），不是邻接矩阵。"""
+    """读取 GETNext 的 graph_X.csv（地点 id、类别、经纬度等），不是邻接矩阵。
+
+    输入:
+        path: str
+    输出:
+        DataFrame，行数 ≈ N，列含 node_name/poi_id、checkin_cnt、poi_catid、latitude、longitude
+    """
     return pd.read_csv(path)

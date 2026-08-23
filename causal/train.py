@@ -10,6 +10,11 @@
   - 损失是「总分 CE + 兴趣环带 + 混杂对齐 + 对抗 + 重建」
   - 验证时同时报 factual（总分）和 deconf（只用兴趣分）两套指标
     选 checkpoint 只用 factual，避免用去混淆分数去刷写实 Acc（§7）
+
+形状记号：B=batch，T=pad 后长度，N=POI 数，d / d_z / d_c 见 causal/README.md。
+collate 之后一个 batch 的关键 tensor：
+  poi/cat (B,T)  time (B,T)  user (B,)  pad (B,T) bool
+  y_poi/y_cat (B,T)  pad 处为 -1 ； y_time (B,T) pad 处为 -1.0
 """
 import logging
 import os
@@ -45,6 +50,10 @@ class TqdmLoggingHandler(logging.Handler):
     """日志走 tqdm.write，进度条才不会被 print 打乱（和 GETNext 相同）。"""
 
     def emit(self, record):
+        """
+        输入: logging.LogRecord（无 tensor）
+        输出: 无返回，把格式化后的字符串写到屏幕
+        """
         try:
             tqdm.write(self.format(record))
             self.flush()
@@ -53,7 +62,14 @@ class TqdmLoggingHandler(logging.Handler):
 
 
 def setup_logger(save_dir, verbose=False):
-    """文件里记全量日志；屏幕默认只显示关键 INFO。"""
+    """文件里记全量日志；屏幕默认只显示关键 INFO。
+
+    输入:
+        save_dir: str
+        verbose: bool
+    输出:
+        无返回。副作用：配置 root logger。
+    """
     root = logging.getLogger()
     for handler in root.handlers[:]:
         root.removeHandler(handler)
@@ -70,7 +86,13 @@ def setup_logger(save_dir, verbose=False):
 
 
 def resolve_device(args):
-    """有 GPU 且没开 --no-cuda 就用 CUDA，否则 CPU。云端环境是 CPU。"""
+    """有 GPU 且没开 --no-cuda 就用 CUDA，否则 CPU。云端环境是 CPU。
+
+    输入:
+        args.no_cuda / args.device: 标量
+    输出:
+        torch.device
+    """
     if args.no_cuda or not torch.cuda.is_available():
         return torch.device('cpu')
     return torch.device(args.device)
@@ -87,6 +109,18 @@ class TrajectoryDataset(Dataset):
 
     def __init__(self, df, poi_id2idx, user_id2idx, poi_idx2cat_idx, time_col,
                  min_len, skip_unknown_user=False):
+        """
+        输入:
+            df: DataFrame，签到行
+            poi_id2idx / user_id2idx / poi_idx2cat_idx: dict，id → 下标
+            time_col: str
+            min_len: int，输入前缀最短长度
+            skip_unknown_user: bool
+        输出:
+            无返回。self.samples: list[dict]，每条样本是 Python list，还不是 tensor：
+              poi / cat / time / label_poi / label_time / label_cat: 长度 T_i
+              user_idx: int ； traj_id: str
+        """
         self.samples = []
         grouped = df.groupby('trajectory_id', sort=False)
         n_traj = df['trajectory_id'].nunique()
@@ -124,9 +158,19 @@ class TrajectoryDataset(Dataset):
             })
 
     def __len__(self):
+        """
+        输入: 无
+        输出: int，轨迹条数
+        """
         return len(self.samples)
 
     def __getitem__(self, index):
+        """
+        输入:
+            index: int
+        输出:
+            dict（Python list，不是 tensor），见 __init__
+        """
         return self.samples[index]
 
 
@@ -136,6 +180,18 @@ def collate_pad(batch):
     补齐位置：
       输入填 0（后面用 pad=True 让注意力忽略）
       标签填 -1（CrossEntropy 的 ignore_index，不算进损失）
+
+    输入:
+        batch: list[dict]，长度 B，每条是 Dataset 样本（Python list）
+    输出: dict
+        poi / cat: (B, T) long
+        time:      (B, T) float
+        user:      (B,)   long
+        pad:       (B, T) bool，True=pad
+        y_poi / y_cat: (B, T) long，pad=-1
+        y_time:    (B, T) float，pad=-1.0
+        lengths:   list[int] 长度 B，每条真实 T_i
+        traj_ids:  list[str] 长度 B
     """
     lengths = [len(s['poi']) for s in batch]
     bsz, tmax = len(batch), max(lengths)
@@ -167,7 +223,15 @@ def collate_pad(batch):
 
 
 def masked_mse(pred, target, ignore=-1):
-    """时间回归用：跳过标签为 -1 的补齐位置。"""
+    """时间回归用：跳过标签为 -1 的补齐位置。
+
+    输入:
+        pred:   (B, T)  模型预测的时刻
+        target: (B, T)  真值，pad 处为 ignore
+        ignore: 标量，默认 -1
+    输出:
+        标量 tensor ()  MSE；若全是 pad 则返回 0
+    """
     mask = target != ignore
     if mask.sum() == 0:
         return pred.new_zeros(())
@@ -178,6 +242,19 @@ def gather_c_of_y(origin, y_poi, time_feat, buffers, num_hour_bins):
     """取出「真值下一站 Y」上的离散混杂 C，给对抗 / 重建损失用（D.4.4）。
 
     补齐位置一律写成 -1，后面 CE 会忽略。
+
+    输入:
+        origin:    (B, T) long，当前步 POI
+        y_poi:     (B, T) long，下一步真值，pad=-1
+        time_feat: (B, T) float
+        buffers:   dist_bin (N,N), pop_bin (N,), area_id (N,)
+        num_hour_bins: int = H
+    输出: 四个 (B, T) long
+        c_acc:  起点→Y 的距离桶
+        c_pop:  Y 的热度档
+        c_area: Y 的区域
+        c_hour: 当前时刻桶
+        pad 位置全是 -1
     """
     valid = y_poi >= 0
     safe_o = origin.clamp(min=0)
@@ -205,6 +282,18 @@ def compute_losses(model, batch, buffers, args, ce):
       + λ_recon * 用 h_c 重建 C
       + λ_cat   * 从 h_z 猜下一站类别（可选）
       + λ_time  * 时间 MSE（默认权重 0）
+
+    输入:
+        model: CausalNextPOI
+        batch: collate_pad 的 dict，见该函数输出
+        buffers: table.to_torch() 的 dict
+        args: 超参
+        ce: CrossEntropyLoss(ignore_index=-1)
+    输出: dict
+        loss / main / pref / conf / adv / recon / cat / time: 标量 tensor
+        s / s_pref: (B, T, N)
+        h: (B, T, d)  h_z: (B, T, d_z)  h_c: (B, T, d_c)
+        c_acc / c_pop / c_area: (B, T) long
     """
     poi = batch['poi']
     h, h_z, h_c = model.encode(poi, batch['time'], batch['cat'], batch['user'], batch['pad'])
@@ -260,7 +349,18 @@ def compute_losses(model, batch, buffers, args, ce):
 
 @torch.no_grad()
 def eval_batch_metrics(parts, batch, buffers, meter_fact, meter_deconf):
-    """验证：factual 用总分 s，deconf 用兴趣分 s_pref；只评每条轨迹最后一步。"""
+    """验证：factual 用总分 s，deconf 用兴趣分 s_pref；只评每条轨迹最后一步。
+
+    输入:
+        parts: compute_losses 的输出
+            s / s_pref: (B, T, N)
+            c_acc / c_pop: (B, T)
+        batch: collate dict，y_poi (B,T)，poi (B,T)，lengths list[B]
+        buffers['area_id']: (N,)
+        meter_fact / meter_deconf: SliceMeter
+    输出:
+        无返回。每条轨迹往两个 meter 各 add 一次。
+    """
     y_np = batch['y_poi'].detach().cpu().numpy()
     s_np = parts['s'].detach().cpu().numpy()
     pref_np = parts['s_pref'].detach().cpu().numpy()
@@ -279,7 +379,17 @@ def eval_batch_metrics(parts, batch, buffers, meter_fact, meter_deconf):
 
 
 def format_epoch_summary(epoch, total, lr, train_loss, fact, deconf, saved=False, score=None):
-    """每个 epoch 打在屏幕上的一小段摘要。"""
+    """每个 epoch 打在屏幕上的一小段摘要。
+
+    输入:
+        epoch / total: int
+        lr: float
+        train_loss / fact / deconf: dict，含 top1 等标量
+        saved: bool
+        score: float 或 None
+    输出:
+        str，多行文本
+    """
     lines = [
         SEP,
         f' Epoch {epoch + 1:>4d}/{total}  |  lr={lr:.2e}',
@@ -301,6 +411,16 @@ def format_epoch_summary(epoch, total, lr, train_loss, fact, deconf, saved=False
 
 
 def train(args):
+    """完整训练循环：读数据 → 建表 → epoch 更新 → 按 factual Acc 存 checkpoint。
+
+    输入:
+        args: argparse.Namespace，见 param_parser
+    输出:
+        无返回。写到 args.save_dir：
+          checkpoints/best_epoch.state.pt
+          poi_table_meta.pkl
+          metrics-train.txt / metrics-val.txt
+    """
     # ---------- 0. 目录、日志、把本次参数存下来 ----------
     args.device = resolve_device(args)
     args.save_dir = increment_path(Path(args.project) / args.name, exist_ok=args.exist_ok, sep='-')
@@ -501,7 +621,14 @@ def train(args):
 
 
 def _to_device(batch, device):
-    """把 batch 里的 Tensor 搬到 CPU 或 GPU；traj_id 这种字符串保持原样。"""
+    """把 batch 里的 Tensor 搬到 CPU 或 GPU；traj_id 这种字符串保持原样。
+
+    输入:
+        batch: dict，value 是 Tensor 或 list
+        device: torch.device
+    输出:
+        新 dict，Tensor 形状不变，只是 device 变了
+    """
     out = {}
     for k, v in batch.items():
         if torch.is_tensor(v):
@@ -512,8 +639,23 @@ def _to_device(batch, device):
 
 
 def _write_hist(save_dir, train_hist, val_hist):
-    """每个 epoch 覆盖写入 metrics-train.txt / metrics-val.txt，方便画曲线。"""
+    """每个 epoch 覆盖写入 metrics-train.txt / metrics-val.txt，方便画曲线。
+
+    输入:
+        save_dir: str
+        train_hist: list[dict]，每个 epoch 的训练标量
+        val_hist: list[dict]，含 loss / factual / deconf_pref
+    输出:
+        无返回。写两个文本文件。
+    """
     def _dump(path, rows, prefix):
+        """
+        输入:
+            path: str
+            rows: list[dict]
+            prefix: str
+        输出: 无返回，写文本行 prefix_key_list=[...]
+        """
         with open(path, 'w') as f:
             if not rows:
                 return

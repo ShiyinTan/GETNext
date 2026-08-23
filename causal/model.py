@@ -9,10 +9,14 @@
 
 Time2Vec / 用户嵌入 / 类别嵌入仍从原来的 model.py 借用，只读不改。
 
-数据形状约定（和 train.py 一致）：
+形状记号（每个函数的「输入 / 输出」都用这套）：
   B = batch 里有几条轨迹
   T = 补齐后的时间步长度
   N = 地点词表大小（NYC 大约 5000）
+  d = d_model = poi+user+time+cat 嵌入维之和
+  d_z = poi_embed_dim（兴趣向量，必须和 e_p 同宽才能点积）
+  d_c = hc_dim（混杂向量）
+  K / P / A / H = 距离桶 / 热度档 / 区域数 / 时刻桶
 """
 import math
 
@@ -35,16 +39,38 @@ class GradientReversalFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, lambd):
+        """
+        输入:
+            x: 任意形状，训练时是 h_z，(B, T, d_z)
+            lambd: 标量 float，反转强度
+        输出:
+            与 x 同形状，数值不变
+        """
         ctx.lambd = lambd
         return x.view_as(x)
 
     @staticmethod
     def backward(ctx, grad_output):
+        """
+        输入:
+            grad_output: 与 forward 的 x 同形状
+        输出:
+            (对 x 的梯度, 对 lambd 的梯度)
+            对 x: 同形状，等于 -λ * grad_output
+            对 lambd: None（不更新这个标量）
+        """
         return -ctx.lambd * grad_output, None
 
 
 def grad_reverse(x, lambd=1.0):
-    """给 h_z 套上 GRL 后再送给对抗分类器。"""
+    """给 h_z 套上 GRL 后再送给对抗分类器。
+
+    输入:
+        x: (B, T, d_z)
+        lambd: 标量
+    输出:
+        (B, T, d_z) 前向原样；反向梯度乘 -λ
+    """
     return GradientReversalFn.apply(x, lambd)
 
 
@@ -52,6 +78,14 @@ class PositionalEncoding(nn.Module):
     """给序列每个位置加上「第几步」的正弦编码。输入输出都是 (B, T, d)。"""
 
     def __init__(self, d_model, dropout=0.1, max_len=512):
+        """
+        输入:
+            d_model: int = d
+            dropout: float
+            max_len: int，最长位置
+        输出:
+            无返回。buffer pe: (1, max_len, d)
+        """
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
         pe = torch.zeros(max_len, d_model)
@@ -62,6 +96,12 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe.unsqueeze(0))  # (1, max_len, d)，随模型保存但不训练
 
     def forward(self, x):
+        """
+        输入:
+            x: (B, T, d)
+        输出:
+            (B, T, d)  加上位置编码后 dropout
+        """
         x = x + self.pe[:, :x.size(1)]
         return self.dropout(x)
 
@@ -74,12 +114,25 @@ class FuseEmbeddings(nn.Module):
     """
 
     def __init__(self, dim_a, dim_b):
+        """
+        输入:
+            dim_a, dim_b: int，两路向量最后一维
+        输出:
+            无返回。Linear 权重: (dim_a+dim_b, dim_a+dim_b)
+        """
         super().__init__()
         embed_dim = dim_a + dim_b
         self.fuse = nn.Linear(embed_dim, embed_dim)
         self.act = nn.LeakyReLU(0.2)
 
     def forward(self, a, b):
+        """
+        输入:
+            a: (..., dim_a)  常见 (B, T, user_dim) 或 (B, T, time_dim)
+            b: (..., dim_b)  常见 (B, T, poi_dim)  或 (B, T, cat_dim)
+        输出:
+            (..., dim_a+dim_b)
+        """
         return self.act(self.fuse(torch.cat((a, b), dim=-1)))
 
 
@@ -94,6 +147,24 @@ class CausalNextPOI(nn.Module):
     """
 
     def __init__(self, args, num_pois, num_users, num_cats, table):
+        """
+        输入:
+            args: 超参对象（标量，无 tensor）
+            num_pois: int = N
+            num_users: int = n_user
+            num_cats: int = n_cat
+            table: PoiConfounderTable，只用 K/P/A/H 这些桶数
+        输出:
+            无返回。主要权重形状：
+              poi_embedding.weight: (N, d_z)
+              user_embedding: (n_user, user_embed_dim)
+              cat_embedding: (n_cat, cat_embed_dim)
+              split_z: d → d_z ； split_c: d → d_c
+              g_acc.weight: (K, 1)
+              psi.weight: (N, d_c)
+              adv_*: d_z → K/P/A/H ； recon_*: d_c → K/P/A/H
+              cat_head: d_z → n_cat ； time_head: d → 1
+        """
         super().__init__()
         self.num_pois = num_pois
         self.poi_embed_dim = args.poi_embed_dim
@@ -163,9 +234,20 @@ class CausalNextPOI(nn.Module):
     def _token_embed(self, poi_idx, time_feat, cat_idx, user_idx):
         """把一步的 (地点, 时间, 类别, 用户) 融合成 Transformer 的一个 token。
 
-        poi/time/cat: (B, T)   user: (B,) 整条轨迹共用一个用户
-        返回 fused: (B, T, d_model)
         注意：这里没有把距离、热度拼进去（D.3.4）。
+
+        输入:
+            poi_idx:  (B, T) long
+            time_feat:(B, T) float
+            cat_idx:  (B, T) long
+            user_idx: (B,)   long，整条轨迹共用一个用户
+        输出:
+            fused: (B, T, d)
+        中间:
+            poi_e:  (B, T, d_z)
+            user_e: (B, T, user_dim)  把 (B, user_dim) 扩到每个时间步
+            time_e: (B, T, time_dim)  Time2Vec 吃 (B*T, 1) 再 reshape
+            cat_e:  (B, T, cat_dim)
         """
         bsz, seqlen = poi_idx.size()
         poi_e = self.poi_embedding(poi_idx.clamp(min=0))  # padding 下标先夹成 0，后面用 mask 忽略
@@ -179,10 +261,20 @@ class CausalNextPOI(nn.Module):
     def encode(self, poi_idx, time_feat, cat_idx, user_idx, pad_mask):
         """编码器 E + 拆分 S。pad_mask 里 True 表示补齐位置，不参加注意力。
 
-        返回:
-          h   : (B, T, d)  还没拆开的上下文
-          h_z : (B, T, d_z) 兴趣代理
-          h_c : (B, T, d_c) 混杂摘要
+        输入:
+            poi_idx:   (B, T) long
+            time_feat: (B, T) float
+            cat_idx:   (B, T) long
+            user_idx:  (B,)   long
+            pad_mask:  (B, T) bool，True=pad
+        输出:
+            h:   (B, T, d)    还没拆开的上下文
+            h_z: (B, T, d_z)  兴趣代理
+            h_c: (B, T, d_c)  混杂摘要
+        中间:
+            src:    (B, T, d)  token
+            causal: (T, T)     上三角 -inf，第 t 步只能看见 1..t
+            encoder 内部: (T, B, d)  seq-first
         """
         src = self._token_embed(poi_idx, time_feat, cat_idx, user_idx)  # (B, T, d)
         src = src * math.sqrt(self.d_model)
@@ -201,12 +293,32 @@ class CausalNextPOI(nn.Module):
         return h, h_z, h_c
 
     def _s_pref(self, h_z):
-        """兴趣通道：s_pref(p) = h_z 和地点向量 e_p 的点积。输出 (B, T, N)。"""
+        """兴趣通道：s_pref(p) = h_z 和地点向量 e_p 的点积。
+
+        输入:
+            h_z: (B, T, d_z)
+        输出:
+            s_pref: (B, T, N)
+        中间:
+            e_p: (N, d_z)  和输入嵌入绑在一起
+        """
         e_p = self.poi_embedding.weight  # (N, d_z)，和输入嵌入绑在一起
         return torch.matmul(h_z, e_p.transpose(0, 1))
 
     def _gather_origin_tables(self, origin_idx, buffers):
-        """按当前起点 p_T 取出「到每一个候选点」的距离桶 / 公里数 / 起点区域。"""
+        """按当前起点 p_T 取出「到每一个候选点」的距离桶 / 公里数 / 起点区域。
+
+        输入:
+            origin_idx: (B, T) long，当前步所在 POI（通常就是输入轨迹 poi）
+            buffers: dict
+                dist_bin: (N, N) long
+                dist_km:  (N, N) float
+                area_id:  (N,)   long
+        输出:
+            dist_bin:    (B, T, N)  从每个起点到全部候选的距离桶
+            dist_km:     (B, T, N)  同上，公里
+            origin_area: (B, T)     每个起点自己的区域 id
+        """
         safe = origin_idx.clamp(min=0)
         dist_bin = buffers['dist_bin'][safe]          # (B, T, N)
         dist_km = buffers['dist_km'][safe]
@@ -214,7 +326,23 @@ class CausalNextPOI(nn.Module):
         return dist_bin, dist_km, origin_area
 
     def _s_conf_from_phi(self, h_c, dist_bin, origin_area, buffers):
-        """混杂通道：s_conf = 距离分 + 热度分 + 区域分 + h_c 匹配分。"""
+        """混杂通道：s_conf = 距离分 + 热度分 + 区域分 + h_c 匹配分。
+
+        输入:
+            h_c:         (B, T, d_c)
+            dist_bin:    (B, T, N) long
+            origin_area: (B, T)    long
+            buffers:
+                log_pop: (N,)
+                area_id: (N,)
+        输出:
+            s_conf: (B, T, N)
+            parts: dict
+                s_acc:  (B, T, N)  距离桶查表分
+                s_pop:  (1, 1, N)  热度分，与轨迹无关，广播到 B,T
+                s_area: (B, T, N)  起点区域 · 终点区域
+                s_ctx:  (B, T, N)  <W_c h_c, ψ(p)>
+        """
         s_acc = self.g_acc(dist_bin.clamp(min=0)).squeeze(-1)             # (B, T, N)
         s_pop = self.g_pop(buffers['log_pop'].unsqueeze(-1)).squeeze(-1)  # (N,)，与轨迹无关
         dest_area_e = self.area_emb(buffers['area_id'])                   # (N, 16)
@@ -235,7 +363,18 @@ class CausalNextPOI(nn.Module):
               bar_acc_bin=None, bar_pop_log=None):
         """按推理模式给出总分 / 兴趣分 / 混杂分（附录 D.5）。
 
-        返回 (s, s_pref, s_conf, dist_km)，前三个形状都是 (B, T, N)。
+        输入:
+            h_z:        (B, T, d_z)
+            h_c:        (B, T, d_c)
+            origin_idx: (B, T) long
+            buffers:    见 _gather_origin_tables / _s_conf_from_phi
+            mode:       str
+            bar_acc_bin / bar_pop_log: do(C) 用的标量干预值
+        输出:
+            s:      (B, T, N)  用来排序的总分
+            s_pref: (B, T, N)
+            s_conf: (B, T, N)
+            dist_km:(B, T, N)  真实公里数（评估切片用，不受 mode 改写）
 
         mode 含义（人话）：
           factual     用真实距离和热度，回答「现实约束下下一站会去哪」
@@ -281,6 +420,13 @@ class CausalNextPOI(nn.Module):
 
         越近越高（-α × 公里），越热越高（+β × log热度），同区域再加一点。
         用来把「近/热/同区」从兴趣通道里挤到 s_conf。
+
+        输入:
+            origin_idx: (B, T) long
+            buffers: dist_km (N,N), log_pop (N,), area_id (N,)
+            alpha, beta: 标量
+        输出:
+            g_tilde: (B, T, N)
         """
         dist_km = buffers['dist_km'][origin_idx.clamp(min=0)]
         log_pop = buffers['log_pop'].view(1, 1, -1)
@@ -290,10 +436,29 @@ class CausalNextPOI(nn.Module):
         return (-alpha * dist_km) + beta * log_pop + 0.15 * same_area
 
     def adv_logits(self, h_z, lambd):
-        """用 GRL(h_z) 去猜 C 的四个桶。分类器想猜对，编码器被反转梯度逼着猜不对。"""
+        """用 GRL(h_z) 去猜 C 的四个桶。分类器想猜对，编码器被反转梯度逼着猜不对。
+
+        输入:
+            h_z: (B, T, d_z)
+            lambd: 标量
+        输出: 四个分类 logit
+            acc:  (B, T, K)
+            pop:  (B, T, P)
+            area: (B, T, A)
+            hour: (B, T, H)
+        """
         z = grad_reverse(h_z, lambd)
         return self.adv_acc(z), self.adv_pop(z), self.adv_area(z), self.adv_hour(z)
 
     def recon_logits(self, h_c):
-        """用 h_c 去重建 C：逼混杂摘要真的装着可观测的近/热/区/时。"""
+        """用 h_c 去重建 C：逼混杂摘要真的装着可观测的近/热/区/时。
+
+        输入:
+            h_c: (B, T, d_c)
+        输出: 四个分类 logit
+            acc:  (B, T, K)
+            pop:  (B, T, P)
+            area: (B, T, A)
+            hour: (B, T, H)
+        """
         return self.recon_acc(h_c), self.recon_pop(h_c), self.recon_area(h_c), self.recon_hour(h_c)
