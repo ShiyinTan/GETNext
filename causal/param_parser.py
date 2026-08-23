@@ -5,6 +5,8 @@
 
 没有 GCN / NodeAttnMap 相关参数：附录 D 用 nn.Embedding 当 e_p，混杂 C 不进 token。
 在仓库根目录运行: python causal/train.py --help
+
+本文件没有 tensor：输入是命令行字符串，输出是 argparse.Namespace（全是标量）。
 """
 import argparse
 
@@ -12,11 +14,23 @@ import torch
 
 
 def _default_device():
-    """有显卡就默认 cuda，没有就 cpu。云端这台机器没有 GPU。"""
+    """有显卡就默认 cuda，没有就 cpu。云端这台机器没有 GPU。
+
+    输入: 无
+    输出: torch.device
+    """
     return torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
 
 def parameter_parser():
+    """
+    输入: sys.argv
+    输出: argparse.Namespace
+        训练标量（epochs/batch/lr/...）和因果标量（lambda_*、桶数）
+        无 tensor。维度相关默认值：
+          poi/user embed=128，time/cat embed=32 → d_model=320
+          hc_dim=64 ； hz_dim 默认等于 poi_embed_dim
+    """
     parser = argparse.ArgumentParser(
         description='因果 next-POI（附录 D：分数分解 + h_z/h_c）')
     parser.add_argument('--seed', type=int, default=42, help='随机种子')

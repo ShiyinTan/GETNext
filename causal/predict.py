@@ -5,6 +5,10 @@
   - 多出来的：每种推理模式各一份指标，并且按距离桶 / 热度档 / 是否跨区切开（§7）
   - 去混淆分数不会并进 factual 的总表，两套分开报
 
+形状记号：B / T / N / d / d_z / d_c 与 train.py 相同。
+预测时 encode 输出 h (B,T,d)、h_z (B,T,d_z)、h_c (B,T,d_c)；
+score 输出 s (B,T,N)。只取每条轨迹最后一步 L-1 写 jsonl。
+
 常用：
   python causal/predict.py --checkpoint runs/causal/<name>/checkpoints/best_epoch.state.pt
 """
@@ -38,6 +42,10 @@ from causal.train import TrajectoryDataset, collate_pad, _to_device
 
 
 def parse_args():
+    """
+    输入: sys.argv（无 tensor）
+    输出: argparse.Namespace，预测用的路径 / batch / modes 等标量
+    """
     p = argparse.ArgumentParser(description='因果 next-POI 预测（附录 D.5 双模式）')
     p.add_argument('--checkpoint', type=str, required=True, help='best_epoch.state.pt 路径')
     p.add_argument('--data-test', type=str, default='dataset/NYC/NYC_test.csv')
@@ -66,6 +74,17 @@ def rebuild_table(cli, args, poi_id2idx, meta):
 
     距离由经纬度现场算（确定的）；热度档、区域 id、先验频率优先用训练保存的 meta，
     避免训练 / 预测切分不一致导致 embedding 下标对不上。
+
+    输入:
+        cli / args: 命令行与 checkpoint 里的超参
+        poi_id2idx: dict，长度 N
+        meta: dict 或 None，来自 poi_table_meta.pkl
+            pop / lat / lon / area_id / pop_bin: (N,)
+            dist_edges: (n_edges,)
+            acc_prior: (K,)  pop_prior: (P,)
+    输出:
+        PoiConfounderTable，数组形状与训练时相同
+          dist_km / dist_bin: (N, N)
     """
     train_df = pd.read_csv(cli.data_train)
     nodes_df = load_nodes_df(cli.data_node_feats)
@@ -98,6 +117,17 @@ def rebuild_table(cli, args, poi_id2idx, meta):
 
 
 def main():
+    """加载 checkpoint，对测试集打 factual / deconf 两套 top-k。
+
+    输入: 命令行（parse_args）
+    输出: 无返回。写
+        predictions/metrics.json
+        predictions/predictions.jsonl
+      循环里关键 tensor：
+        encode → h (B,T,d), h_z (B,T,d_z), h_c (B,T,d_c)
+        score  → s (B,T,N)
+        取 [i, L-1] 得到一条轨迹最后一步的 (N,) 分数，再 argsort 出 top-k
+    """
     cli = parse_args()
     device = torch.device('cpu' if cli.no_cuda or not torch.cuda.is_available() else 'cuda')
     # torch 2.4 需要 weights_only=False 才能加载里面的 argparse.Namespace；1.7 没有这个参数

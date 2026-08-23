@@ -23,7 +23,41 @@
 | `metrics.py` | Acc@k、MRR，以及按距离/热度/是否跨区切开的指标 |
 | `run_cpu_smoke.sh` | CPU 上跑几步，确认能跑通 |
 
-代码里的注释用中文写了「这一段在干什么、对应附录 D 哪一节」。符号对照：
+代码里每个函数的 docstring 都有 **输入 / 输出** 两节，形状用下面这套记号（不要当成具体数字）：
+
+| 记号 | 含义 | NYC 大约 |
+| --- | --- | --- |
+| `B` | 一个 batch 有几条轨迹 | `--batch`，默认 20 |
+| `T` | pad 后的轨迹长度 | 每条轨迹不同，batch 内取最长 |
+| `N` | POI 词表大小 | ~4980 |
+| `d` / `d_model` | Transformer 宽度 = poi+user+time+cat embed | 默认 128+128+32+32=320 |
+| `d_z` | 兴趣向量 `h_z` 宽度，等于 `poi_embed_dim` | 默认 128 |
+| `d_c` | 混杂向量 `h_c` 宽度，`--hc-dim` | 默认 64 |
+| `K` | 距离桶数 `num_acc_bins` | 切分点 `0.5,1,2,5,10` → 通常 6 |
+| `P` | 热度档数 `num_pop_bins` | `--pop-bins`，默认 4 |
+| `A` | 区域数 `num_areas` | 网格压缩后，远小于棋盘格数 |
+| `H` | 时刻桶数 `--time-units` | 默认 48 |
+| `n_cat` / `n_user` | 类别数 / 用户数 | 由 CSV 统计 |
+| `k` | top-k | 预测默认 20 |
+
+常见 tensor（训练一个 batch 时）：
+
+| 变量 | shape | 说明 |
+| --- | --- | --- |
+| `poi` / `cat` | `(B, T)` long | pad 位置填 0 |
+| `time` | `(B, T)` float | 一天内归一化时刻 `[0,1]` |
+| `user` | `(B,)` long | 整条轨迹同一个用户 |
+| `pad` | `(B, T)` bool | True = pad，注意力忽略 |
+| `y_poi` / `y_cat` | `(B, T)` long | 下一步真值，pad = `-1` |
+| `h` | `(B, T, d)` | Transformer 输出 |
+| `h_z` | `(B, T, d_z)` | 兴趣代理 |
+| `h_c` | `(B, T, d_c)` | 混杂摘要 |
+| `s` / `s_pref` / `s_conf` | `(B, T, N)` | 对每个候选 POI 的分 |
+| `C` 表 `dist_bin` / `dist_km` | `(N, N)` | 起点→终点距离桶 / 公里 |
+| `log_pop` / `pop_bin` / `area_id` | `(N,)` | 每个 POI 的热度/区域 |
+| `e_p` 权重 | `(N, d_z)` | POI embedding，和输入查表绑定 |
+
+符号对照：
 
 - `H` / `poi`：历史轨迹（当前已访问的地点序列）
 - `Y` / `y_poi`：下一站真值
