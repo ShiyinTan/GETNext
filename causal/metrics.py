@@ -5,19 +5,20 @@
   所以还要分开看：远距离、冷门地点、跨区域跳转时，还能不能排对。
 
 形状记号：L=去掉 padding 后的真实轨迹长度；N=POI 数。
-GETNext 的 Acc@k / MRR 函数吃的是「一条轨迹」：
+GETNext 的 Acc@k / mAP@20 / MRR 函数吃的是「一条轨迹」：
   y_true_seq: (L,)  每步的真值 POI
   y_pred_seq: (L, N) 每步对全部候选的分数
 只评最后一步 L-1。
+训练时的 epoch 指标和 GETNext 一样：先算每个 batch 的均值，再对 batch 均值取平均。
+预测时 overall 是按轨迹微平均（也和 GETNext predict.py 一样），并额外按 C 切片。
 """
 from collections import defaultdict
 
-import numpy as np
-
 from utils import (
-    MRR_metric_last_timestep,
-    mAP_metric_last_timestep,
-    top_k_acc_last_timestep,
+    RANKING_METRIC_KEYS,
+    batch_last_step_metrics,
+    last_timestep_metric_dict,
+    to_predict_metrics,
 )
 
 
@@ -38,43 +39,51 @@ def last_step_scores(label_row, pred_row, seq_len):
 
 
 def basic_metrics(y_true_seq, y_pred_seq):
-    """一条轨迹的 last-step 指标。返回的是 0/1 命中或 0~1 的排名分数。
+    """一条轨迹的 last-step 指标。与 GETNext train/predict 同一套六个标量。
 
     输入:
         y_true_seq: (L,)  每步真值 POI
         y_pred_seq: (L, N) 每步对 N 个候选的分数
     输出:
-        dict，六个标量：top1/top5/top10/top20/map20/mrr
-        （内部只取最后一步 L-1）
+        dict：top1 / top5 / top10 / top20 / map20 / mrr
     """
-    return {
-        'top1': top_k_acc_last_timestep(y_true_seq, y_pred_seq, k=1),
-        'top5': top_k_acc_last_timestep(y_true_seq, y_pred_seq, k=5),
-        'top10': top_k_acc_last_timestep(y_true_seq, y_pred_seq, k=10),
-        'top20': top_k_acc_last_timestep(y_true_seq, y_pred_seq, k=20),
-        'map20': mAP_metric_last_timestep(y_true_seq, y_pred_seq, k=20),
-        'mrr': MRR_metric_last_timestep(y_true_seq, y_pred_seq),
-    }
+    return last_timestep_metric_dict(y_true_seq, y_pred_seq)
 
 
 def mean_metric_dict(rows):
     """把多条轨迹的指标做平均。没有样本时填 None，避免除零。
 
     输入:
-        rows: list[dict]，每个 dict 是 basic_metrics 的输出（六个标量）
+        rows: list[dict]，每个 dict 是 basic_metrics 的输出
     输出:
         dict，同样六个 key，值为 float 或 None
     """
     if not rows:
-        return {k: None for k in ('top1', 'top5', 'top10', 'top20', 'map20', 'mrr')}
-    keys = rows[0].keys()
-    return {k: float(np.mean([r[k] for r in rows])) for k in keys}
+        return {k: None for k in RANKING_METRIC_KEYS}
+    return {k: float(sum(r[k] for r in rows) / len(rows)) for k in RANKING_METRIC_KEYS}
+
+
+def metrics_for_json(summary):
+    """把 SliceMeter.summary() 里的 top1/map20 转成 GETNext predict.py 的 top1_acc/mAP20。"""
+    out = {}
+    for key, value in summary.items():
+        if isinstance(value, dict) and 'top1' in value:
+            out[key] = to_predict_metrics(value)
+        elif isinstance(value, dict):
+            out[key] = {
+                sk: to_predict_metrics(sv) if isinstance(sv, dict) and 'top1' in sv else sv
+                for sk, sv in value.items()
+            }
+        else:
+            out[key] = value
+    return out
 
 
 class SliceMeter:
     """边推理边收集：整体 + 按距离桶 / 热度档 / 是否跨区。
 
     调用方每来一条轨迹就 add() 一次；最后 summary() 出一份可写入 metrics.json 的字典。
+    overall 是轨迹微平均，和 GETNext predict.py 一致。
     """
 
     def __init__(self):
@@ -112,13 +121,13 @@ class SliceMeter:
         """
         输入: 无（读 self 里已收集的指标）
         输出: dict
-            overall: 六个标量的平均
+            overall: 六个标量的平均（top1/map20 内部名）
             n: int
             by_distance_bucket / by_pop_quartile: {桶号: 平均指标}
             same_area / cross_area: 平均指标
             n_same_area / n_cross_area: int
         """
-        out = {
+        return {
             'overall': mean_metric_dict(self.overall),
             'n': len(self.overall),
             'by_distance_bucket': {str(k): mean_metric_dict(v) for k, v in sorted(self.by_acc.items())},
@@ -128,4 +137,14 @@ class SliceMeter:
             'n_same_area': len(self.same_area),
             'n_cross_area': len(self.cross_area),
         }
-        return out
+
+
+__all__ = [
+    'SliceMeter',
+    'basic_metrics',
+    'batch_last_step_metrics',
+    'last_step_scores',
+    'mean_metric_dict',
+    'metrics_for_json',
+    'to_predict_metrics',
+]

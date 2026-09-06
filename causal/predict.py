@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -36,9 +37,10 @@ from causal.features import (
     pairwise_haversine_km,
     bucketize,
 )
-from causal.metrics import SliceMeter
+from causal.metrics import SliceMeter, metrics_for_json, to_predict_metrics
 from causal.model import CausalNextPOI
 from causal.train import TrajectoryDataset, collate_pad, _to_device
+from utils import mean_or_nan
 
 
 def parse_args():
@@ -192,6 +194,8 @@ def main():
     modes = [m.strip() for m in cli.modes.split(',') if m.strip()]
     meters = {m: SliceMeter() for m in modes}
     predictions = []
+    poi_losses = []
+    criterion_poi = nn.CrossEntropyLoss(ignore_index=-1)
     with torch.no_grad():
         for b_idx, batch in enumerate(tqdm(loader, desc='Predict')):
             if cli.max_batches and b_idx >= cli.max_batches:
@@ -207,6 +211,8 @@ def main():
                 s, s_pref, s_conf, dist_km = model.score(
                     h_z, h_c, poi, buffers, mode=mode, bar_acc_bin=bar_acc)
                 scores_by_mode[mode] = s.cpu().numpy()
+                if mode == 'factual':
+                    poi_losses.append(float(criterion_poi(s.transpose(1, 2), batch['y_poi']).detach().cpu()))
                 c_acc = torch.gather(
                     buffers['dist_bin'][poi.clamp(min=0)], 2,
                     batch['y_poi'].clamp(min=0).unsqueeze(-1)).squeeze(-1).cpu().numpy()
@@ -240,18 +246,22 @@ def main():
                     row['deconf_pref_topk_poi_id'] = [idx2poi.get(int(j)) for j in topk_d]
                 predictions.append(row)
 
+    fact_overall = meters['factual'].summary()['overall'] if 'factual' in meters else meters[modes[0]].summary()['overall']
+    ranking = to_predict_metrics(fact_overall)
     summary = {
         'num_trajectories': len(dataset),
         'checkpoint': cli.checkpoint,
         'data_test': cli.data_test,
         'device': str(device),
         'epoch': ckpt.get('epoch'),
+        'poi_loss': mean_or_nan(poi_losses) if poi_losses else None,
+        **ranking,
         'score_weights': {
             'w_pref': float(args.w_pref), 'w_conf': float(args.w_conf),
             'w_acc': float(args.w_acc), 'w_pop': float(args.w_pop),
             'w_area': float(args.w_area), 'w_ctx': float(args.w_ctx),
         },
-        'modes': {m: meters[m].summary() for m in modes},
+        'modes': {m: metrics_for_json(meters[m].summary()) for m in modes},
     }
     out_dir = cli.output_dir or str(Path(cli.checkpoint).resolve().parents[1] / 'predictions')
     os.makedirs(out_dir, exist_ok=True)
@@ -260,11 +270,17 @@ def main():
     with open(os.path.join(out_dir, 'predictions.jsonl'), 'w', encoding='utf-8') as f:
         for row in predictions:
             f.write(json.dumps(row, ensure_ascii=False) + '\n')
-    print(json.dumps({
+    print_summary = {
         'num_trajectories': summary['num_trajectories'],
+        'checkpoint': summary['checkpoint'],
+        'data_test': summary['data_test'],
         'device': summary['device'],
-        'overall': {m: summary['modes'][m]['overall'] for m in modes},
-    }, indent=2))
+        'epoch': summary['epoch'],
+        'poi_loss': summary['poi_loss'],
+        **ranking,
+        'modes_overall': {m: summary['modes'][m]['overall'] for m in modes},
+    }
+    print(json.dumps(print_summary, indent=2))
     print(f'Wrote metrics to {out_dir}/metrics.json')
     print(f'Wrote predictions to {out_dir}/predictions.jsonl')
 

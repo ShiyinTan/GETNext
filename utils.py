@@ -179,6 +179,135 @@ def MRR_metric_last_timestep(y_true_seq, y_pred_seq):
     return 1 / (r_idx + 1)
 
 
+# Console / file / predict.json share these ranking keys.
+RANKING_METRIC_KEYS = ('top1', 'top5', 'top10', 'top20', 'map20', 'mrr')
+PREDICT_METRIC_KEY_MAP = {
+    'top1': 'top1_acc',
+    'top5': 'top5_acc',
+    'top10': 'top10_acc',
+    'top20': 'top20_acc',
+    'map20': 'mAP20',
+    'mrr': 'mrr',
+}
+
+
+def last_timestep_metric_dict(y_true_seq, y_pred_seq):
+    """One trajectory, last-timestep ranking metrics (GETNext train/predict)."""
+    return {
+        'top1': top_k_acc_last_timestep(y_true_seq, y_pred_seq, k=1),
+        'top5': top_k_acc_last_timestep(y_true_seq, y_pred_seq, k=5),
+        'top10': top_k_acc_last_timestep(y_true_seq, y_pred_seq, k=10),
+        'top20': top_k_acc_last_timestep(y_true_seq, y_pred_seq, k=20),
+        'map20': mAP_metric_last_timestep(y_true_seq, y_pred_seq, k=20),
+        'mrr': MRR_metric_last_timestep(y_true_seq, y_pred_seq),
+    }
+
+
+def batch_last_step_metrics(label_pois, pred_pois, seq_lens):
+    """GETNext train/val batch eval: last-step metrics, then mean over the batch.
+
+    label_pois: (B, T), pred_pois: (B, T, N), seq_lens: iterable of B lengths.
+    """
+    n = len(seq_lens)
+    acc = {k: 0.0 for k in RANKING_METRIC_KEYS}
+    if n == 0:
+        return {k: float('nan') for k in RANKING_METRIC_KEYS}
+    for y, s, L in zip(label_pois, pred_pois, seq_lens):
+        m = last_timestep_metric_dict(y[:L], s[:L])
+        for k in RANKING_METRIC_KEYS:
+            acc[k] += m[k]
+    return {k: acc[k] / n for k in RANKING_METRIC_KEYS}
+
+
+def mean_or_nan(values):
+    return float(np.mean(values)) if len(values) else float('nan')
+
+
+def to_predict_metrics(m):
+    """Map train-style keys (top1, map20) to predict.py metrics.json keys."""
+    out = {}
+    for src, dst in PREDICT_METRIC_KEY_MAP.items():
+        v = None if m is None else m.get(src)
+        if v is None or (isinstance(v, (float, np.floating)) and not np.isfinite(v)):
+            out[dst] = None
+        else:
+            out[dst] = float(v)
+    return out
+
+
+def format_ranking_lines(m, indent='        '):
+    """Two console lines: Acc@k then mAP@20 / MRR."""
+    return [
+        (f'{indent}Acc@1 {m["top1"]:.4f}  Acc@5 {m["top5"]:.4f}  '
+         f'Acc@10 {m["top10"]:.4f}  Acc@20 {m["top20"]:.4f}'),
+        f'{indent}mAP@20 {m["map20"]:.4f}  MRR {m["mrr"]:.4f}',
+    ]
+
+
+def format_epoch_summary(epoch, total_epochs, lr, train_m, val_m, saved_best=False,
+                         best_score=None, extra_lines=None, sep='-' * 72):
+    """Compact, aligned epoch metrics block for the console (GETNext layout)."""
+    lines = [
+        sep,
+        f' Epoch {epoch + 1:>4d}/{total_epochs}  |  lr={lr:.2e}',
+        sep,
+        (f' Train  loss {train_m["loss"]:>8.4f}  '
+         f'poi {train_m["poi"]:>7.4f}  time {train_m["time"]:>7.4f}  cat {train_m["cat"]:>7.4f}'),
+        *format_ranking_lines(train_m),
+        (f' Val    loss {val_m["loss"]:>8.4f}  '
+         f'poi {val_m["poi"]:>7.4f}  time {val_m["time"]:>7.4f}  cat {val_m["cat"]:>7.4f}'),
+        *format_ranking_lines(val_m),
+    ]
+    if extra_lines:
+        lines.extend(extra_lines)
+    if saved_best:
+        lines.append(f' * Saved best checkpoint  (score={best_score:.4f})')
+    lines.append(sep)
+    return '\n'.join(lines)
+
+
+def epoch_ckpt_metrics(split, m):
+    """Checkpoint `epoch_{train,val}_metrics` dict used by GETNext train.py."""
+    return {
+        f'epoch_{split}_loss': m['loss'],
+        f'epoch_{split}_poi_loss': m['poi'],
+        f'epoch_{split}_time_loss': m['time'],
+        f'epoch_{split}_cat_loss': m['cat'],
+        f'epoch_{split}_top1_acc': m['top1'],
+        f'epoch_{split}_top5_acc': m['top5'],
+        f'epoch_{split}_top10_acc': m['top10'],
+        f'epoch_{split}_top20_acc': m['top20'],
+        f'epoch_{split}_mAP20': m['map20'],
+        f'epoch_{split}_mrr': m['mrr'],
+    }
+
+
+def write_epoch_metrics_txt(path, split, rows, extra_keys=None):
+    """Write GETNext `metrics-train.txt` / `metrics-val.txt` lists.
+
+    rows: list of dicts with keys loss, poi, time, cat, top1..top20, map20, mrr.
+    extra_keys: optional list of (file_name, dict_key), e.g. causal aux losses.
+    """
+    file_keys = [
+        (f'{split}_epochs_loss_list', 'loss'),
+        (f'{split}_epochs_poi_loss_list', 'poi'),
+        (f'{split}_epochs_time_loss_list', 'time'),
+        (f'{split}_epochs_cat_loss_list', 'cat'),
+        (f'{split}_epochs_top1_acc_list', 'top1'),
+        (f'{split}_epochs_top5_acc_list', 'top5'),
+        (f'{split}_epochs_top10_acc_list', 'top10'),
+        (f'{split}_epochs_top20_acc_list', 'top20'),
+        (f'{split}_epochs_mAP20_list', 'map20'),
+        (f'{split}_epochs_mrr_list', 'mrr'),
+    ]
+    if extra_keys:
+        file_keys.extend(extra_keys)
+    with open(path, 'w') as f:
+        for file_key, dict_key in file_keys:
+            vals = [float(f'{r[dict_key]:.4f}') for r in rows]
+            print(f'{file_key}={vals}', file=f)
+
+
 def array_round(x, k=4):
     # For a list of float values, keep k decimals of each element
     return list(np.around(np.array(x), k))

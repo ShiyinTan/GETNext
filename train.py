@@ -20,8 +20,8 @@ from tqdm import tqdm
 from dataloader import load_graph_adj_mtx, load_graph_node_features
 from model import GCN, NodeAttnMap, UserEmbeddings, Time2Vec, CategoryEmbeddings, FuseEmbeddings, TransformerModel
 from param_parser import parameter_parser
-from utils import increment_path, calculate_laplacian_matrix, zipdir, top_k_acc_last_timestep, \
-    mAP_metric_last_timestep, MRR_metric_last_timestep, maksed_mse_loss
+from utils import increment_path, calculate_laplacian_matrix, zipdir, maksed_mse_loss, \
+    batch_last_step_metrics, format_epoch_summary, write_epoch_metrics_txt, epoch_ckpt_metrics
 
 SEP = '-' * 72
 
@@ -55,29 +55,6 @@ def setup_logger(save_dir, verbose=False):
     console.setFormatter(logging.Formatter('%(message)s'))
     root.addHandler(console)
     logging.getLogger('matplotlib.font_manager').disabled = True
-
-
-def format_epoch_summary(epoch, total_epochs, lr, train_m, val_m, saved_best=False, best_score=None):
-    """Compact, aligned epoch metrics block for the console."""
-    lines = [
-        SEP,
-        f' Epoch {epoch + 1:>4d}/{total_epochs}  |  lr={lr:.2e}',
-        SEP,
-        (f' Train  loss {train_m["loss"]:>8.4f}  '
-         f'poi {train_m["poi"]:>7.4f}  time {train_m["time"]:>7.4f}  cat {train_m["cat"]:>7.4f}'),
-        (f'        Acc@1 {train_m["top1"]:.4f}  Acc@5 {train_m["top5"]:.4f}  '
-         f'Acc@10 {train_m["top10"]:.4f}  Acc@20 {train_m["top20"]:.4f}'),
-        f'        mAP@20 {train_m["map20"]:.4f}  MRR {train_m["mrr"]:.4f}',
-        (f' Val    loss {val_m["loss"]:>8.4f}  '
-         f'poi {val_m["poi"]:>7.4f}  time {val_m["time"]:>7.4f}  cat {val_m["cat"]:>7.4f}'),
-        (f'        Acc@1 {val_m["top1"]:.4f}  Acc@5 {val_m["top5"]:.4f}  '
-         f'Acc@10 {val_m["top10"]:.4f}  Acc@20 {val_m["top20"]:.4f}'),
-        f'        mAP@20 {val_m["map20"]:.4f}  MRR {val_m["mrr"]:.4f}',
-    ]
-    if saved_best:
-        lines.append(f' * Saved best checkpoint  (score={best_score:.4f})')
-    lines.append(SEP)
-    return '\n'.join(lines)
 
 
 def train(args):
@@ -536,32 +513,18 @@ def train(args):
             optimizer.step()
 
             # 步骤13: 按「最后时间步」计算 Top-k / mAP / MRR
-            top1_acc = 0
-            top5_acc = 0
-            top10_acc = 0
-            top20_acc = 0
-            mAP20 = 0
-            mrr = 0
             batch_label_pois = y_poi.detach().cpu().numpy()              # (B, T_max)
             batch_pred_pois = y_pred_poi_adjusted.detach().cpu().numpy() # (B, T_max, N_poi)
             batch_pred_times = y_pred_time.detach().cpu().numpy()
             batch_pred_cats = y_pred_cat.detach().cpu().numpy()
-            for label_pois, pred_pois, seq_len in zip(batch_label_pois, batch_pred_pois, batch_seq_lens):
-                label_pois = label_pois[:seq_len]  # (T_i,)
-                pred_pois = pred_pois[:seq_len, :]  # (T_i, N_poi)
-                top1_acc += top_k_acc_last_timestep(label_pois, pred_pois, k=1)
-                top5_acc += top_k_acc_last_timestep(label_pois, pred_pois, k=5)
-                top10_acc += top_k_acc_last_timestep(label_pois, pred_pois, k=10)
-                top20_acc += top_k_acc_last_timestep(label_pois, pred_pois, k=20)
-                mAP20 += mAP_metric_last_timestep(label_pois, pred_pois, k=20)
-                mrr += MRR_metric_last_timestep(label_pois, pred_pois)
-            batch_top1 = top1_acc / len(batch_label_pois)
-            train_batches_top1_acc_list.append(batch_top1)
-            train_batches_top5_acc_list.append(top5_acc / len(batch_label_pois))
-            train_batches_top10_acc_list.append(top10_acc / len(batch_label_pois))
-            train_batches_top20_acc_list.append(top20_acc / len(batch_label_pois))
-            train_batches_mAP20_list.append(mAP20 / len(batch_label_pois))
-            train_batches_mrr_list.append(mrr / len(batch_label_pois))
+            batch_m = batch_last_step_metrics(batch_label_pois, batch_pred_pois, batch_seq_lens)
+            batch_top1 = batch_m['top1']
+            train_batches_top1_acc_list.append(batch_m['top1'])
+            train_batches_top5_acc_list.append(batch_m['top5'])
+            train_batches_top10_acc_list.append(batch_m['top10'])
+            train_batches_top20_acc_list.append(batch_m['top20'])
+            train_batches_mAP20_list.append(batch_m['map20'])
+            train_batches_mrr_list.append(batch_m['mrr'])
             train_batches_loss_list.append(loss.detach().cpu().numpy())
             train_batches_poi_loss_list.append(loss_poi.detach().cpu().numpy())
             train_batches_time_loss_list.append(loss_time.detach().cpu().numpy())
@@ -676,32 +639,18 @@ def train(args):
             loss = loss_poi + loss_time * args.time_loss_weight + loss_cat
 
             # 只评最后时间步的 next-POI 指标
-            top1_acc = 0
-            top5_acc = 0
-            top10_acc = 0
-            top20_acc = 0
-            mAP20 = 0
-            mrr = 0
             batch_label_pois = y_poi.detach().cpu().numpy()
             batch_pred_pois = y_pred_poi_adjusted.detach().cpu().numpy()
             batch_pred_times = y_pred_time.detach().cpu().numpy()
             batch_pred_cats = y_pred_cat.detach().cpu().numpy()
-            for label_pois, pred_pois, seq_len in zip(batch_label_pois, batch_pred_pois, batch_seq_lens):
-                label_pois = label_pois[:seq_len]  # (T_i,)
-                pred_pois = pred_pois[:seq_len, :]  # (T_i, N_poi)
-                top1_acc += top_k_acc_last_timestep(label_pois, pred_pois, k=1)
-                top5_acc += top_k_acc_last_timestep(label_pois, pred_pois, k=5)
-                top10_acc += top_k_acc_last_timestep(label_pois, pred_pois, k=10)
-                top20_acc += top_k_acc_last_timestep(label_pois, pred_pois, k=20)
-                mAP20 += mAP_metric_last_timestep(label_pois, pred_pois, k=20)
-                mrr += MRR_metric_last_timestep(label_pois, pred_pois)
-            batch_top1 = top1_acc / len(batch_label_pois)
-            val_batches_top1_acc_list.append(batch_top1)
-            val_batches_top5_acc_list.append(top5_acc / len(batch_label_pois))
-            val_batches_top10_acc_list.append(top10_acc / len(batch_label_pois))
-            val_batches_top20_acc_list.append(top20_acc / len(batch_label_pois))
-            val_batches_mAP20_list.append(mAP20 / len(batch_label_pois))
-            val_batches_mrr_list.append(mrr / len(batch_label_pois))
+            batch_m = batch_last_step_metrics(batch_label_pois, batch_pred_pois, batch_seq_lens)
+            batch_top1 = batch_m['top1']
+            val_batches_top1_acc_list.append(batch_m['top1'])
+            val_batches_top5_acc_list.append(batch_m['top5'])
+            val_batches_top10_acc_list.append(batch_m['top10'])
+            val_batches_top20_acc_list.append(batch_m['top20'])
+            val_batches_mAP20_list.append(batch_m['map20'])
+            val_batches_mrr_list.append(batch_m['mrr'])
             val_batches_loss_list.append(loss.detach().cpu().numpy())
             val_batches_poi_loss_list.append(loss_poi.detach().cpu().numpy())
             val_batches_time_loss_list.append(loss_time.detach().cpu().numpy())
@@ -867,30 +816,8 @@ def train(args):
                 'poi_idx2cat_idx_dict': poi_idx2cat_idx_dict,
                 'node_attn_map': node_attn_model(X, A),
                 'args': args,
-                'epoch_train_metrics': {
-                    'epoch_train_loss': epoch_train_loss,
-                    'epoch_train_poi_loss': epoch_train_poi_loss,
-                    'epoch_train_time_loss': epoch_train_time_loss,
-                    'epoch_train_cat_loss': epoch_train_cat_loss,
-                    'epoch_train_top1_acc': epoch_train_top1_acc,
-                    'epoch_train_top5_acc': epoch_train_top5_acc,
-                    'epoch_train_top10_acc': epoch_train_top10_acc,
-                    'epoch_train_top20_acc': epoch_train_top20_acc,
-                    'epoch_train_mAP20': epoch_train_mAP20,
-                    'epoch_train_mrr': epoch_train_mrr
-                },
-                'epoch_val_metrics': {
-                    'epoch_val_loss': epoch_val_loss,
-                    'epoch_val_poi_loss': epoch_val_poi_loss,
-                    'epoch_val_time_loss': epoch_val_time_loss,
-                    'epoch_val_cat_loss': epoch_val_cat_loss,
-                    'epoch_val_top1_acc': epoch_val_top1_acc,
-                    'epoch_val_top5_acc': epoch_val_top5_acc,
-                    'epoch_val_top10_acc': epoch_val_top10_acc,
-                    'epoch_val_top20_acc': epoch_val_top20_acc,
-                    'epoch_val_mAP20': epoch_val_mAP20,
-                    'epoch_val_mrr': epoch_val_mrr
-                }
+                'epoch_train_metrics': epoch_ckpt_metrics('train', train_m),
+                'epoch_val_metrics': epoch_ckpt_metrics('val', val_m),
             }
             model_save_dir = os.path.join(args.save_dir, 'checkpoints')
             # Save best val score epoch
@@ -907,31 +834,28 @@ def train(args):
             saved_best=saved_best, best_score=max_val_score if saved_best else None))
 
         # Save train/val metrics for plotting purpose
-        with open(os.path.join(args.save_dir, 'metrics-train.txt'), "w") as f:
-            print(f'train_epochs_loss_list={[float(f"{each:.4f}") for each in train_epochs_loss_list]}', file=f)
-            print(f'train_epochs_poi_loss_list={[float(f"{each:.4f}") for each in train_epochs_poi_loss_list]}', file=f)
-            print(f'train_epochs_time_loss_list={[float(f"{each:.4f}") for each in train_epochs_time_loss_list]}',
-                  file=f)
-            print(f'train_epochs_cat_loss_list={[float(f"{each:.4f}") for each in train_epochs_cat_loss_list]}', file=f)
-            print(f'train_epochs_top1_acc_list={[float(f"{each:.4f}") for each in train_epochs_top1_acc_list]}', file=f)
-            print(f'train_epochs_top5_acc_list={[float(f"{each:.4f}") for each in train_epochs_top5_acc_list]}', file=f)
-            print(f'train_epochs_top10_acc_list={[float(f"{each:.4f}") for each in train_epochs_top10_acc_list]}',
-                  file=f)
-            print(f'train_epochs_top20_acc_list={[float(f"{each:.4f}") for each in train_epochs_top20_acc_list]}',
-                  file=f)
-            print(f'train_epochs_mAP20_list={[float(f"{each:.4f}") for each in train_epochs_mAP20_list]}', file=f)
-            print(f'train_epochs_mrr_list={[float(f"{each:.4f}") for each in train_epochs_mrr_list]}', file=f)
-        with open(os.path.join(args.save_dir, 'metrics-val.txt'), "w") as f:
-            print(f'val_epochs_loss_list={[float(f"{each:.4f}") for each in val_epochs_loss_list]}', file=f)
-            print(f'val_epochs_poi_loss_list={[float(f"{each:.4f}") for each in val_epochs_poi_loss_list]}', file=f)
-            print(f'val_epochs_time_loss_list={[float(f"{each:.4f}") for each in val_epochs_time_loss_list]}', file=f)
-            print(f'val_epochs_cat_loss_list={[float(f"{each:.4f}") for each in val_epochs_cat_loss_list]}', file=f)
-            print(f'val_epochs_top1_acc_list={[float(f"{each:.4f}") for each in val_epochs_top1_acc_list]}', file=f)
-            print(f'val_epochs_top5_acc_list={[float(f"{each:.4f}") for each in val_epochs_top5_acc_list]}', file=f)
-            print(f'val_epochs_top10_acc_list={[float(f"{each:.4f}") for each in val_epochs_top10_acc_list]}', file=f)
-            print(f'val_epochs_top20_acc_list={[float(f"{each:.4f}") for each in val_epochs_top20_acc_list]}', file=f)
-            print(f'val_epochs_mAP20_list={[float(f"{each:.4f}") for each in val_epochs_mAP20_list]}', file=f)
-            print(f'val_epochs_mrr_list={[float(f"{each:.4f}") for each in val_epochs_mrr_list]}', file=f)
+        write_epoch_metrics_txt(
+            os.path.join(args.save_dir, 'metrics-train.txt'), 'train',
+            [{'loss': l, 'poi': p, 'time': t, 'cat': c,
+              'top1': a1, 'top5': a5, 'top10': a10, 'top20': a20,
+              'map20': mp, 'mrr': mr}
+             for l, p, t, c, a1, a5, a10, a20, mp, mr in zip(
+                 train_epochs_loss_list, train_epochs_poi_loss_list,
+                 train_epochs_time_loss_list, train_epochs_cat_loss_list,
+                 train_epochs_top1_acc_list, train_epochs_top5_acc_list,
+                 train_epochs_top10_acc_list, train_epochs_top20_acc_list,
+                 train_epochs_mAP20_list, train_epochs_mrr_list)])
+        write_epoch_metrics_txt(
+            os.path.join(args.save_dir, 'metrics-val.txt'), 'val',
+            [{'loss': l, 'poi': p, 'time': t, 'cat': c,
+              'top1': a1, 'top5': a5, 'top10': a10, 'top20': a20,
+              'map20': mp, 'mrr': mr}
+             for l, p, t, c, a1, a5, a10, a20, mp, mr in zip(
+                 val_epochs_loss_list, val_epochs_poi_loss_list,
+                 val_epochs_time_loss_list, val_epochs_cat_loss_list,
+                 val_epochs_top1_acc_list, val_epochs_top5_acc_list,
+                 val_epochs_top10_acc_list, val_epochs_top20_acc_list,
+                 val_epochs_mAP20_list, val_epochs_mrr_list)])
 
     logging.info(f'Training finished. Best val score={max_val_score:.4f}')
     logging.info(f'Checkpoints: {os.path.join(args.save_dir, "checkpoints")}')
