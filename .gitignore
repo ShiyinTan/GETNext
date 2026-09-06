@@ -1,6 +1,7 @@
 .venv/
 .venv-cpu/
 .venv-gpu/
+.conda/
 __pycache__/
 *.pyc
 runs/

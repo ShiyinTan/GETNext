@@ -236,10 +236,52 @@ print("numpy ", numpy.__version__, "pandas", pandas.__version__)
 PY
 ```
 
-CPU 环境：`torch` 版本带 `+cpu`，`cuda` 为 `False`。  
-GPU 环境：版本带 `+cu121`（或 `cu118` / `cu124`），`cuda` 为 `True`。
+CPU 环境：`cuda` 为 `False`。venv/pip 的版本字符串带 `+cpu`；conda 的 CPU 包常常只显示 `2.4.1`。  
+GPU 环境：有显卡时 `cuda` 为 `True`。venv/pip 带 `+cu121`（或 `cu118` / `cu124`）；conda 同样可能只显示 `2.4.1`，以 `cuda.is_available()` 为准。
 
 新开 shell 时激活**当前要用的那个** venv（`.venv` / `.venv-cpu` / `.venv-gpu`）。
+
+### Conda（和 venv 二选一）
+
+也可以用 conda / mamba / micromamba，**不要和 `.venv` 同时 activate**。CPU / GPU 是两个环境名，和 venv 一样不能混装两份 torch。
+
+需要先有 conda。没有的话装 [Miniconda](https://docs.conda.io/en/latest/miniconda.html) 或 Mambaforge，再开一个新终端。
+
+**CPU：**
+
+```bash
+conda env create -f environment-cpu.yml
+conda activate getnext-cpu
+unzip -o dataset/NYC.zip -d dataset/
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"  # False；conda CPU 常显示 2.4.1 而无 +cpu
+```
+
+一键（会解压 NYC）：
+
+```bash
+bash scripts/setup_conda_cpu.sh
+conda activate getnext-cpu
+```
+
+**GPU（CUDA 12.1）：**
+
+```bash
+conda env create -f environment-gpu.yml
+conda activate getnext-gpu
+unzip -o dataset/NYC.zip -d dataset/
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.device_count())"
+```
+
+有显卡时应为 `True` 且 `device_count >= 1`。CUDA 11.8 把 `environment-gpu.yml` 里的 `pytorch-cuda=12.1` 改成 `11.8`。
+
+同一台机器两种都要：
+
+```bash
+conda activate getnext-cpu
+conda activate getnext-gpu
+```
+
+`mamba env create -f …` / `micromamba create -f …` 和上面的 yml 通用。装好后用第 3 节那段 `import torch, numpy, pandas…` 检查即可。
 
 ### 4. 数据文件
 
