@@ -97,7 +97,7 @@ Same Python range (3.10–3.12). CPU and GPU are **two env names**, same rule as
 conda env create -f environment-cpu.yml
 conda activate getnext-cpu
 unzip -o dataset/NYC.zip -d dataset/
-python -c "import torch; print(torch.__version__, torch.cuda.is_available())"  # expect False
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"  # False; conda CPU is often "2.4.1" without +cpu
 ```
 
 Or: `bash scripts/setup_conda_cpu.sh` then `conda activate getnext-cpu`.
@@ -108,7 +108,7 @@ Or: `bash scripts/setup_conda_cpu.sh` then `conda activate getnext-cpu`.
 conda env create -f environment-gpu.yml
 conda activate getnext-gpu
 unzip -o dataset/NYC.zip -d dataset/
-python -c "import torch; print(torch.__version__, torch.cuda.is_available())"  # expect True
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"  # True on a real GPU; conda may print "2.4.1" without +cu121
 ```
 
 For CUDA 11.8, edit `pytorch-cuda=12.1` in `environment-gpu.yml` to `11.8`. `mamba` / `micromamba` work with the same `-f` files.

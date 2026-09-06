@@ -5,6 +5,7 @@
 #   conda activate getnext-cpu
 #
 # Same packages as requirements.txt, plus CPU torch from the pytorch channel.
+# Conda CPU torch often reports version "2.4.1" (no "+cpu"); check cuda=False.
 name: getnext-cpu
 channels:
   - pytorch

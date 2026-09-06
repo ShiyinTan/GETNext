@@ -236,8 +236,8 @@ print("numpy ", numpy.__version__, "pandas", pandas.__version__)
 PY
 ```
 
-CPU 环境：`torch` 版本带 `+cpu`，`cuda` 为 `False`。  
-GPU 环境：版本带 `+cu121`（或 `cu118` / `cu124`），`cuda` 为 `True`。
+CPU 环境：`cuda` 为 `False`。venv/pip 的版本字符串带 `+cpu`；conda 的 CPU 包常常只显示 `2.4.1`。  
+GPU 环境：有显卡时 `cuda` 为 `True`。venv/pip 带 `+cu121`（或 `cu118` / `cu124`）；conda 同样可能只显示 `2.4.1`，以 `cuda.is_available()` 为准。
 
 新开 shell 时激活**当前要用的那个** venv（`.venv` / `.venv-cpu` / `.venv-gpu`）。
 
@@ -253,7 +253,7 @@ GPU 环境：版本带 `+cu121`（或 `cu118` / `cu124`），`cuda` 为 `True`�
 conda env create -f environment-cpu.yml
 conda activate getnext-cpu
 unzip -o dataset/NYC.zip -d dataset/
-python -c "import torch; print(torch.__version__, torch.cuda.is_available())"  # False
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"  # False；conda CPU 常显示 2.4.1 而无 +cpu
 ```
 
 一键（会解压 NYC）：

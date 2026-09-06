@@ -6,6 +6,7 @@
 #
 # For CUDA 11.8, change pytorch-cuda=12.1 to pytorch-cuda=11.8.
 # Same non-torch packages as requirements.txt.
+# Conda GPU torch often reports "2.4.1" (no "+cu121"); check cuda=True on a real GPU.
 name: getnext-gpu
 channels:
   - pytorch
