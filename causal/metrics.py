@@ -5,7 +5,7 @@
   所以还要分开看：远距离、冷门地点、跨区域跳转时，还能不能排对。
 
 形状记号：L=去掉 padding 后的真实轨迹长度；N=POI 数。
-GETNext 的 Acc@k / mAP@20 / MRR 函数吃的是「一条轨迹」：
+GETNext 的 Acc@k / HR@k / H@k / NDCG@k / mAP@20 / MRR 函数吃的是「一条轨迹」：
   y_true_seq: (L,)  每步的真值 POI
   y_pred_seq: (L, N) 每步对全部候选的分数
 只评最后一步 L-1。
@@ -45,7 +45,7 @@ def basic_metrics(y_true_seq, y_pred_seq):
         y_true_seq: (L,)  每步真值 POI
         y_pred_seq: (L, N) 每步对 N 个候选的分数
     输出:
-        dict：top1 / top5 / top10 / top20 / map20 / mrr
+        dict：top1 / top5 / top10 / top20 / hr1 / h5 / h10 / ndcg5 / ndcg10 / map20 / mrr
     """
     return last_timestep_metric_dict(y_true_seq, y_pred_seq)
 

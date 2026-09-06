@@ -70,8 +70,10 @@ from causal.metrics import batch_last_step_metrics
 from causal.model import CausalNextPOI
 from causal.param_parser import parameter_parser
 from utils import (
+    RANKING_METRIC_KEYS,
     epoch_ckpt_metrics,
     format_epoch_summary,
+    format_ranking_lines,
     increment_path,
     mean_or_nan,
     write_epoch_metrics_txt,
@@ -525,7 +527,7 @@ def train(args):
     logging.info('[4/4] Start training...')
     max_val_score = -np.inf
     train_hist, val_hist = [], []
-    rank_keys = ('top1', 'top5', 'top10', 'top20', 'map20', 'mrr')
+    rank_keys = RANKING_METRIC_KEYS
     train_loss_keys = ('loss', 'poi', 'time', 'cat', 'pref', 'conf', 'adv', 'recon')
 
     for epoch in range(args.epochs):
@@ -612,6 +614,11 @@ def train(args):
                     'epoch_val_deconf_top5_acc': deconf['top5'],
                     'epoch_val_deconf_top10_acc': deconf['top10'],
                     'epoch_val_deconf_top20_acc': deconf['top20'],
+                    'epoch_val_deconf_HR1': deconf['hr1'],
+                    'epoch_val_deconf_H5': deconf['h5'],
+                    'epoch_val_deconf_H10': deconf['h10'],
+                    'epoch_val_deconf_NDCG5': deconf['ndcg5'],
+                    'epoch_val_deconf_NDCG10': deconf['ndcg10'],
                     'epoch_val_deconf_mAP20': deconf['map20'],
                     'epoch_val_deconf_mrr': deconf['mrr'],
                 },
@@ -622,11 +629,7 @@ def train(args):
             max_val_score = monitor_score
             saved = True
 
-        extra_lines = [
-            (f' Deconf Acc@1 {deconf["top1"]:.4f}  Acc@5 {deconf["top5"]:.4f}  '
-             f'Acc@10 {deconf["top10"]:.4f}  Acc@20 {deconf["top20"]:.4f}'),
-            f'        mAP@20 {deconf["map20"]:.4f}  MRR {deconf["mrr"]:.4f}',
-        ]
+        extra_lines = format_ranking_lines(deconf, indent=' Deconf ')
         logging.info(format_epoch_summary(
             epoch, args.epochs, optimizer.param_groups[0]['lr'], train_m, val_m,
             saved_best=saved, best_score=max_val_score if saved else None,
@@ -683,6 +686,11 @@ def _write_hist(save_dir, train_hist, val_hist):
             ('val_epochs_deconf_top5_acc_list', 'deconf_top5'),
             ('val_epochs_deconf_top10_acc_list', 'deconf_top10'),
             ('val_epochs_deconf_top20_acc_list', 'deconf_top20'),
+            ('val_epochs_deconf_hr1_list', 'deconf_hr1'),
+            ('val_epochs_deconf_h5_list', 'deconf_h5'),
+            ('val_epochs_deconf_h10_list', 'deconf_h10'),
+            ('val_epochs_deconf_ndcg5_list', 'deconf_ndcg5'),
+            ('val_epochs_deconf_ndcg10_list', 'deconf_ndcg10'),
             ('val_epochs_deconf_mAP20_list', 'deconf_map20'),
             ('val_epochs_deconf_mrr_list', 'deconf_mrr'),
         ])

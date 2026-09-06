@@ -180,26 +180,61 @@ def MRR_metric_last_timestep(y_true_seq, y_pred_seq):
 
 
 # Console / file / predict.json share these ranking keys.
-RANKING_METRIC_KEYS = ('top1', 'top5', 'top10', 'top20', 'map20', 'mrr')
+# HR@1 / H@k are hit-rate aliases of Acc@k (single ground-truth next POI).
+RANKING_METRIC_KEYS = (
+    'top1', 'top5', 'top10', 'top20',
+    'hr1', 'h5', 'h10',
+    'ndcg5', 'ndcg10',
+    'map20', 'mrr',
+)
 PREDICT_METRIC_KEY_MAP = {
     'top1': 'top1_acc',
     'top5': 'top5_acc',
     'top10': 'top10_acc',
     'top20': 'top20_acc',
+    'hr1': 'HR1',
+    'h5': 'H5',
+    'h10': 'H10',
+    'ndcg5': 'NDCG5',
+    'ndcg10': 'NDCG10',
     'map20': 'mAP20',
     'mrr': 'mrr',
 }
 
 
+def last_step_rank(y_true_seq, y_pred_seq):
+    """1-indexed rank of the last-step true POI (higher score = better)."""
+    y_true = y_true_seq[-1]
+    y_pred = y_pred_seq[-1]
+    rec_list = y_pred.argsort()[::-1]
+    return int(np.where(rec_list == y_true)[0][0]) + 1
+
+
+def ndcg_at_k_from_rank(rank, k):
+    """NDCG@k for a single relevant item: 1/log2(rank+1) if rank<=k else 0."""
+    if rank > k:
+        return 0.0
+    return 1.0 / math.log2(rank + 1)
+
+
 def last_timestep_metric_dict(y_true_seq, y_pred_seq):
-    """One trajectory, last-timestep ranking metrics (GETNext train/predict)."""
+    """One trajectory, last-timestep ranking metrics (GETNext + HR / H / NDCG)."""
+    rank = last_step_rank(y_true_seq, y_pred_seq)
+    hit1 = 1 if rank <= 1 else 0
+    hit5 = 1 if rank <= 5 else 0
+    hit10 = 1 if rank <= 10 else 0
     return {
-        'top1': top_k_acc_last_timestep(y_true_seq, y_pred_seq, k=1),
-        'top5': top_k_acc_last_timestep(y_true_seq, y_pred_seq, k=5),
-        'top10': top_k_acc_last_timestep(y_true_seq, y_pred_seq, k=10),
-        'top20': top_k_acc_last_timestep(y_true_seq, y_pred_seq, k=20),
-        'map20': mAP_metric_last_timestep(y_true_seq, y_pred_seq, k=20),
-        'mrr': MRR_metric_last_timestep(y_true_seq, y_pred_seq),
+        'top1': hit1,
+        'top5': hit5,
+        'top10': hit10,
+        'top20': 1 if rank <= 20 else 0,
+        'hr1': hit1,
+        'h5': hit5,
+        'h10': hit10,
+        'ndcg5': ndcg_at_k_from_rank(rank, 5),
+        'ndcg10': ndcg_at_k_from_rank(rank, 10),
+        'map20': 0.0 if rank > 20 else 1.0 / rank,
+        'mrr': 1.0 / rank,
     }
 
 
@@ -223,8 +258,18 @@ def mean_or_nan(values):
     return float(np.mean(values)) if len(values) else float('nan')
 
 
+def with_hit_aliases(m):
+    """Fill HR@1 / H@5 / H@10 from Acc@k when a row only has top* keys."""
+    out = dict(m)
+    out.setdefault('hr1', out.get('top1'))
+    out.setdefault('h5', out.get('top5'))
+    out.setdefault('h10', out.get('top10'))
+    return out
+
+
 def to_predict_metrics(m):
-    """Map train-style keys (top1, map20) to predict.py metrics.json keys."""
+    """Map train-style keys (top1, map20, ndcg5) to predict.py metrics.json keys."""
+    m = None if m is None else with_hit_aliases(m)
     out = {}
     for src, dst in PREDICT_METRIC_KEY_MAP.items():
         v = None if m is None else m.get(src)
@@ -236,11 +281,13 @@ def to_predict_metrics(m):
 
 
 def format_ranking_lines(m, indent='        '):
-    """Two console lines: Acc@k then mAP@20 / MRR."""
+    """Two console lines: HR@1 / H@k / Acc@20, then NDCG / mAP@20 / MRR."""
+    m = with_hit_aliases(m)
     return [
-        (f'{indent}Acc@1 {m["top1"]:.4f}  Acc@5 {m["top5"]:.4f}  '
-         f'Acc@10 {m["top10"]:.4f}  Acc@20 {m["top20"]:.4f}'),
-        f'{indent}mAP@20 {m["map20"]:.4f}  MRR {m["mrr"]:.4f}',
+        (f'{indent}HR@1 {m["hr1"]:.4f}  H@5 {m["h5"]:.4f}  '
+         f'H@10 {m["h10"]:.4f}  Acc@20 {m["top20"]:.4f}'),
+        (f'{indent}NDCG@5 {m["ndcg5"]:.4f}  NDCG@10 {m["ndcg10"]:.4f}  '
+         f'mAP@20 {m["map20"]:.4f}  MRR {m["mrr"]:.4f}'),
     ]
 
 
@@ -268,6 +315,7 @@ def format_epoch_summary(epoch, total_epochs, lr, train_m, val_m, saved_best=Fal
 
 def epoch_ckpt_metrics(split, m):
     """Checkpoint `epoch_{train,val}_metrics` dict used by GETNext train.py."""
+    m = with_hit_aliases(m)
     return {
         f'epoch_{split}_loss': m['loss'],
         f'epoch_{split}_poi_loss': m['poi'],
@@ -277,6 +325,11 @@ def epoch_ckpt_metrics(split, m):
         f'epoch_{split}_top5_acc': m['top5'],
         f'epoch_{split}_top10_acc': m['top10'],
         f'epoch_{split}_top20_acc': m['top20'],
+        f'epoch_{split}_HR1': m['hr1'],
+        f'epoch_{split}_H5': m['h5'],
+        f'epoch_{split}_H10': m['h10'],
+        f'epoch_{split}_NDCG5': m['ndcg5'],
+        f'epoch_{split}_NDCG10': m['ndcg10'],
         f'epoch_{split}_mAP20': m['map20'],
         f'epoch_{split}_mrr': m['mrr'],
     }
@@ -285,9 +338,11 @@ def epoch_ckpt_metrics(split, m):
 def write_epoch_metrics_txt(path, split, rows, extra_keys=None):
     """Write GETNext `metrics-train.txt` / `metrics-val.txt` lists.
 
-    rows: list of dicts with keys loss, poi, time, cat, top1..top20, map20, mrr.
+    rows: list of dicts with keys loss, poi, time, cat, top1..top20, map20, mrr,
+    plus ndcg5/ndcg10 (HR@1 / H@5 / H@10 are filled from Acc@k if missing).
     extra_keys: optional list of (file_name, dict_key), e.g. causal aux losses.
     """
+    rows = [with_hit_aliases(r) for r in rows]
     file_keys = [
         (f'{split}_epochs_loss_list', 'loss'),
         (f'{split}_epochs_poi_loss_list', 'poi'),
@@ -297,6 +352,11 @@ def write_epoch_metrics_txt(path, split, rows, extra_keys=None):
         (f'{split}_epochs_top5_acc_list', 'top5'),
         (f'{split}_epochs_top10_acc_list', 'top10'),
         (f'{split}_epochs_top20_acc_list', 'top20'),
+        (f'{split}_epochs_hr1_list', 'hr1'),
+        (f'{split}_epochs_h5_list', 'h5'),
+        (f'{split}_epochs_h10_list', 'h10'),
+        (f'{split}_epochs_ndcg5_list', 'ndcg5'),
+        (f'{split}_epochs_ndcg10_list', 'ndcg10'),
         (f'{split}_epochs_mAP20_list', 'map20'),
         (f'{split}_epochs_mrr_list', 'mrr'),
     ]

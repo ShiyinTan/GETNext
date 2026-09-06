@@ -25,6 +25,7 @@ from model import (
     UserEmbeddings,
 )
 from utils import (
+    RANKING_METRIC_KEYS,
     calculate_laplacian_matrix,
     last_timestep_metric_dict,
     mean_or_nan,
@@ -219,15 +220,8 @@ def main():
         return y_pred_poi_adjusted
 
     criterion_poi = nn.CrossEntropyLoss(ignore_index=-1)
-    metrics = {
-        "top1": [],
-        "top5": [],
-        "top10": [],
-        "top20": [],
-        "map20": [],
-        "mrr": [],
-        "poi_loss": [],
-    }
+    metrics = {k: [] for k in RANKING_METRIC_KEYS}
+    metrics["poi_loss"] = []
     predictions = []
 
     with torch.no_grad():
@@ -285,7 +279,7 @@ def main():
                 )
 
     ranking = to_predict_metrics(
-        {k: mean_or_nan(metrics[k]) for k in ("top1", "top5", "top10", "top20", "map20", "mrr")}
+        {k: mean_or_nan(metrics[k]) for k in RANKING_METRIC_KEYS}
     )
     summary = {
         "num_trajectories": len(dataset),
