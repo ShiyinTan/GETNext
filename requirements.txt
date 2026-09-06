@@ -5,6 +5,9 @@
 #   CPU:  pip install "torch>=2.1,<2.5" --index-url https://download.pytorch.org/whl/cpu
 #   GPU:  pip install "torch>=2.1,<2.5" --index-url https://download.pytorch.org/whl/cu121
 #         (pick cu118 / cu121 / cu124 from https://pytorch.org/get-started/locally/)
+# Do not put CPU and CUDA torch in the same venv: pip treats 2.4.1+cpu and
+# 2.4.1+cu121 as the same version, so a second install is a no-op. Use .venv
+# for one machine, or .venv-cpu and .venv-gpu if you need both.
 #
 # Packages actually imported by this repo:
 #   numpy, pandas, tqdm, PyYAML  — train / predict (GETNext and causal)
