@@ -315,6 +315,92 @@ bash causal/run_cpu_smoke.sh
 
 ## Quick start
 
+### 推荐训练（NYC GPU）
+
+和 GETNext 论文同规模的编码器，外加因果拆分的默认损失 / 分数权重。
+**先用这一套**，不要一上来网格搜 `w_*`。选 checkpoint 仍看 **val factual Acc@1 / Acc@20**；每个 epoch 会顺带打 test，只作观察。
+
+比较收敛时看日志里的 `poi`（主 CE），不要看总 `loss`（里面有 `10 ×` 时间 MSE，掉得很快但不代表 Acc）。
+
+```bash
+python causal/train.py \
+  --data-train dataset/NYC/NYC_train.csv \
+  --data-val dataset/NYC/NYC_val.csv \
+  --data-test dataset/NYC/NYC_test.csv \
+  --data-node-feats dataset/NYC/graph_X.csv \
+  --data-adj-mtx dataset/NYC/graph_A.csv \
+  --time-units 48 \
+  --time-feature norm_in_day_time \
+  --poi-embed-dim 128 \
+  --user-embed-dim 128 \
+  --time-embed-dim 32 \
+  --cat-embed-dim 32 \
+  --hc-dim 64 \
+  --transformer-nhid 1024 \
+  --transformer-nlayers 2 \
+  --transformer-nhead 2 \
+  --transformer-dropout 0.3 \
+  --batch 16 \
+  --epochs 200 \
+  --lr 0.001 \
+  --weight_decay 5e-4 \
+  --lambda-pref 0.05 \
+  --lambda-conf 0.05 \
+  --lambda-adv 0.05 \
+  --lambda-recon 0.05 \
+  --lambda-cat 0.05 \
+  --lambda-time 10 \
+  --align-alpha 0.2 \
+  --align-beta 0.3 \
+  --align-gamma 0.3 \
+  --w-pref 1 --w-conf 1 \
+  --w-acc 1 --w-pop 1 --w-tpop 1 --w-area 1 --w-ctx 1 --w-rel 1 \
+  --dist-bins 0.5,1,2,5,10 \
+  --pop-bins 4 \
+  --area-grid-deg 0.02 \
+  --seed 42 \
+  --workers 0 \
+  --device cuda \
+  --name nyc-causal \
+  --exist-ok
+```
+
+指定 GPU：把 `--device cuda` 换成 `--device cuda:0`。显存不够把 `--batch` 改成 `8`。
+
+| 项 | 取值 | 为什么 |
+|----|------|--------|
+| 编码器 | embed 128/128/32/32，Transformer 1024/2/2，dropout 0.3 | 与 GETNext 论文 NYC 同规模；`e_p` 仍是 `nn.Embedding` |
+| `--hc-dim 64` | `h_c` 宽度 | `h_z` 默认等于 `poi-embed-dim`（128），才能做 `<h_z, e_p>` |
+| `--batch 16` `--epochs 200` `--lr 0.001` | 优化 | 与 GETNext 论文命令一致（不要用 parser 默认 batch=20） |
+| `--lambda-time 10` | 时间 **MSE** | 与 GETNext `--time-loss-weight` 对齐；不是 CE |
+| `--lambda-*` 其余 `0.05` | 环带 / 混杂对齐 / 对抗 / 重建 / 类别 | 主 CE 权重永远是 1；辅助项保持弱，避免冲掉 `L_main` |
+| `--align-alpha/beta/gamma` 0.2 / 0.3 / 0.3 | `g̃` | 近、签到热、**转移热**推进 `s_conf`；`A_rel` 不进 `g̃` |
+| 全部 `--w-* 1` | 分数音量 | 训练保持 1；`g_*` 自己会学尺度。只需事后扫 `--w-conf` |
+| `--data-adj-mtx graph_A.csv` | 拆成 `A_pop` + `A_rel` | 热度进 `s_conf`，残差相关只加在 factual |
+
+训练后再扫混杂音量（不必重训）：
+
+```bash
+python causal/predict.py \
+  --checkpoint runs/causal/nyc-causal/checkpoints/best_epoch.state.pt \
+  --data-test dataset/NYC/NYC_test.csv \
+  --w-conf 0.5
+```
+
+`--w-conf` 建议只试 `{0.5, 1, 2}`：factual 太偏近/热就降；factual 几乎等于 deconf 就升。
+
+| 现象 | 先怎么动 |
+|------|----------|
+| `poi` 掉很快，val Acc@1 不动 | 先验捷径。预测时 `--w-conf 0.5`，不要加模型 |
+| factual 涨、deconf 几乎不动 | 混杂在干活、`h_z` 偏弱。可把 `--lambda-pref` / `--lambda-adv` 升到 `0.1` 再训一档 |
+| 两套 Acc 都涨 | 拆分在起作用，保持这套 |
+| 总 `loss` 很低但 `poi` 仍高 | 多半是时间 MSE；忽略总 loss |
+| OOM | `--batch 8`；再不行 `--transformer-nhid 512` |
+
+不要开 `--conf-aux-ce`（会让 `s_conf` 再抢主 CE）。不要六个 `w_*` 一起网格搜。
+
+TKY / Gowalla：超参不变，只改 `--data-*` 四条路径。
+
 ### CPU smoke (few batches, small model)
 
 ```bash
@@ -337,22 +423,7 @@ python causal/train.py \
   --hc-dim 32 --transformer-nhid 256 --transformer-nlayers 2 --transformer-nhead 2
 ```
 
-### GPU (paper-scale-ish)
-
-```bash
-python causal/train.py \
-  --device cuda --batch 16 --epochs 200 --name nyc-causal-gpu --exist-ok \
-  --poi-embed-dim 128 --user-embed-dim 128 --time-embed-dim 32 --cat-embed-dim 32 \
-  --hc-dim 64 --transformer-nhid 1024 --transformer-nlayers 2 --transformer-nhead 2
-```
-
-Force a specific GPU:
-
-```bash
-python causal/train.py --device cuda:0 --batch 16 --epochs 200 --name nyc-cuda0 --exist-ok
-```
-
-`graph_A.csv` **is** an input, but it is **not** a GCN. Destination in-degree (transition popularity) goes into `s_conf`; the residual after subtracting popularity and distance is `s_rel` on factual scores only. `e_p` stays `nn.Embedding`. Check-in popularity `C_pop` is still counted from **train** check-ins.
+CPU 迷你跑仍会读默认的 `graph_A.csv`（拆成查表先验，不是 GCN）。正式结果请用上面的 GPU 推荐命令。
 
 ---
 
