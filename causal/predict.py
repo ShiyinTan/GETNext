@@ -32,6 +32,7 @@ if str(ROOT) not in sys.path:
 
 from causal.features import (
     build_poi_table,
+    fill_graph_transition_tables,
     fill_transition_priors,
     load_nodes_df,
     pairwise_haversine_km,
@@ -54,6 +55,8 @@ def parse_args():
     p.add_argument('--data-train', type=str, default='dataset/NYC/NYC_train.csv',
                    help='用来按训练集口径重建热度 / 区域表')
     p.add_argument('--data-node-feats', type=str, default='dataset/NYC/graph_X.csv')
+    p.add_argument('--data-adj-mtx', type=str, default='dataset/NYC/graph_A.csv',
+                   help='若 poi_table_meta 没有 a_rel，则从这里重算转移先验')
     p.add_argument('--batch', type=int, default=16)
     p.add_argument('--workers', type=int, default=0)
     p.add_argument('--short-traj-thres', type=int, default=2)
@@ -73,9 +76,11 @@ def parse_args():
     p.add_argument('--w-conf', type=float, default=None,
                    help='覆盖混杂通道权重。训练完只扫这一个即可，不必重训')
     p.add_argument('--w-acc', type=float, default=None, help='覆盖 s_conf 距离项权重')
-    p.add_argument('--w-pop', type=float, default=None, help='覆盖 s_conf 热度项权重')
+    p.add_argument('--w-pop', type=float, default=None, help='覆盖 s_conf 签到热度项权重')
+    p.add_argument('--w-tpop', type=float, default=None, help='覆盖 s_conf 转移热度 A_pop 权重')
     p.add_argument('--w-area', type=float, default=None, help='覆盖 s_conf 区域项权重')
     p.add_argument('--w-ctx', type=float, default=None, help='覆盖 s_conf 情境项权重')
+    p.add_argument('--w-rel', type=float, default=None, help='覆盖 factual 残差相关 s_rel 权重')
     return p.parse_args()
 
 
@@ -123,6 +128,17 @@ def rebuild_table(cli, args, poi_id2idx, meta):
         table.dist_bin = bucketize(table.dist_km, edges)
         table.num_acc_bins = int(meta.get('num_acc_bins', table.dist_bin.max() + 1))
         table.num_pop_bins = int(meta.get('num_pop_bins', table.pop_bin.max() + 1))
+        if 'log_tpop' in meta and 'a_rel' in meta:
+            table.log_tpop = meta['log_tpop']
+            table.a_rel = meta['a_rel']
+        else:
+            fill_graph_transition_tables(
+                table, getattr(cli, 'data_adj_mtx', None),
+                cli.data_node_feats, poi_id2idx)
+    else:
+        fill_graph_transition_tables(
+            table, getattr(cli, 'data_adj_mtx', None),
+            cli.data_node_feats, poi_id2idx)
     return table
 
 
@@ -153,7 +169,7 @@ def main():
     args.feature3 = getattr(args, 'feature3', cli.feature3)
     args.feature4 = getattr(args, 'feature4', cli.feature4)
     # 预测时可以覆盖分数权重，不必重训。没传的开关保持 checkpoint 里的值（旧 ckpt 缺省为 1）。
-    for key in ('w_pref', 'w_conf', 'w_acc', 'w_pop', 'w_area', 'w_ctx'):
+    for key in ('w_pref', 'w_conf', 'w_acc', 'w_pop', 'w_tpop', 'w_area', 'w_ctx', 'w_rel'):
         override = getattr(cli, key)
         if override is not None:
             setattr(args, key, override)
@@ -259,7 +275,9 @@ def main():
         'score_weights': {
             'w_pref': float(args.w_pref), 'w_conf': float(args.w_conf),
             'w_acc': float(args.w_acc), 'w_pop': float(args.w_pop),
+            'w_tpop': float(getattr(args, 'w_tpop', 1.0)),
             'w_area': float(args.w_area), 'w_ctx': float(args.w_ctx),
+            'w_rel': float(getattr(args, 'w_rel', 1.0)),
         },
         'modes': {m: metrics_for_json(meters[m].summary()) for m in modes},
     }

@@ -8,15 +8,21 @@
   c_area : 地点落在哪一块地理格子
   c_hour : 现在大概几点（用 GETNext 已有的日内时间特征分桶）
 
+另外把 GETNext 的轨迹流图 graph_A **拆开用**，不灌进 h_z / e_p：
+  log_tpop : 目的地入度 log1p(sum_i A_ij)，转移热度，进 s_conf
+  a_rel    : 去掉热度 + 距离之后的残差相关，只进 factual 的 s_rel
+
 为什么要事先算、而且按「候选点 p」来算？
   附录 D.3.4 要求：距离/热度不能偷偷写进共享向量 h（否则标签泄漏，
   模型等于提前看见了「答案离我多远」）。推理时要对词表里每一个 p
   复现同样的特征，所以这里做成 (起点, 终点) 的大表。
+  附录 A：不要把原始 A 无约束地喂给 GCN / 拼进 token。
 
 本文件不训练网络，只准备查找表，给 model.py / train.py 用。
 
 形状记号：N=POI 数；K=距离桶；P=热度档；A=区域数；H=时刻桶。
 """
+import os
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -110,6 +116,7 @@ class PoiConfounderTable:
 
     字段形状:
         lat / lon / pop / log_pop / area_id / pop_bin: (N,)
+        log_tpop: (N,)  转移入度热度；a_rel: (N, N) 残差相关
         dist_km / dist_bin: (N, N)
         dist_edges: (n_edges,)  pop_edges: (≤ P-1,)
         acc_prior: (K,)  pop_prior: (P,)  填完 fill_transition_priors 之后才有
@@ -139,6 +146,9 @@ class PoiConfounderTable:
     pop_prior: np.ndarray = field(default=None)
     median_acc_bin: int = 0
     median_pop_bin: int = 0
+    # graph_A 拆开：转移热度进 s_conf；残差相关只进 factual s_rel
+    log_tpop: np.ndarray = field(default=None)
+    a_rel: np.ndarray = field(default=None)
 
     def hour_bin(self, norm_in_day_time):
         """GETNext 的时间特征在 [0,1]（一天里的比例）→ 时刻桶 0..47（默认半小时一档）。
@@ -161,15 +171,22 @@ class PoiConfounderTable:
             dist_bin:  (N, N) long
             dist_km:   (N, N) float32
             log_pop:   (N,)   float32
+            log_tpop:  (N,)   float32  转移入度热度
+            a_rel:     (N, N) float32  残差相关（factual 专用）
             pop_bin:   (N,)   long
             area_id:   (N,)   long
             acc_prior: (K,)   float32
             pop_prior: (P,)   float32
         """
+        n = int(self.num_pois)
+        log_tpop = self.log_tpop if self.log_tpop is not None else np.zeros(n, dtype=np.float32)
+        a_rel = self.a_rel if self.a_rel is not None else np.zeros((n, n), dtype=np.float32)
         return {
             'dist_bin': torch.from_numpy(self.dist_bin).to(device=device, dtype=torch.long),
             'dist_km': torch.from_numpy(self.dist_km.astype(np.float32)).to(device),
             'log_pop': torch.from_numpy(self.log_pop.astype(np.float32)).to(device),
+            'log_tpop': torch.from_numpy(np.asarray(log_tpop, dtype=np.float32)).to(device),
+            'a_rel': torch.from_numpy(np.asarray(a_rel, dtype=np.float32)).to(device),
             'pop_bin': torch.from_numpy(self.pop_bin).to(device=device, dtype=torch.long),
             'area_id': torch.from_numpy(self.area_id).to(device=device, dtype=torch.long),
             'acc_prior': torch.from_numpy(self.acc_prior.astype(np.float32)).to(device),
@@ -181,7 +198,8 @@ def build_poi_table(nodes_df, train_df, args, poi_id2idx):
     """从 graph_X.csv + 训练集签到，拼出附录 D.2 的静态表 T_poi。
 
     热度只用「训练集」次数，不用验证/测试里的未来签到，避免 C_pop 泄漏。
-    也不用轨迹流图 graph_A.csv（附录 A：GCN 会把热度/近邻再灌一遍）。
+    graph_A.csv 不在这里读：训练时再调用 fill_graph_transition_tables，
+    拆成转移热度 log_tpop 和残差相关 a_rel，不把原始 A 灌进 embedding。
 
     输入:
         nodes_df: DataFrame = graph_X.csv，一行一个 POI，见 train.py 文件头
@@ -265,6 +283,8 @@ def build_poi_table(nodes_df, train_df, args, poi_id2idx):
         lon_min=lon_min,
         grid_deg=grid,
         n_lon=n_lon,
+        log_tpop=np.zeros(num_pois, dtype=np.float32),
+        a_rel=np.zeros((num_pois, num_pois), dtype=np.float32),
     )
     return table
 
@@ -293,6 +313,136 @@ def fill_transition_priors(table, train_pairs):
     table.median_acc_bin = int(np.argmax(table.acc_prior))
     table.median_pop_bin = int(np.argmax(table.pop_prior))
     return table
+
+
+def decompose_graph_adj(A, dist_km, n_dist_bins=8, eps=1e-8):
+    """把观测转移 A 拆成「目的地热度」和「去掉热度+距离后的残差相关」。
+
+    log A_ij ≈ b_j + g(dist_ij) + r_ij
+      b_j     : 列和（谁常被转到）→ log_tpop
+      g(dist) : 按距离桶减去 PMI 均值（近邻转移不该冒充功能相关）
+      r_ij    : 残差 a_rel，给 factual 的 s_rel 用
+
+    输入:
+        A: (N, N) 转移频次，A[i,j] = i→j
+        dist_km: (N, N) 公里距离
+        n_dist_bins: 拟合 g(dist) 时用的距离分位桶数
+        eps: 数值稳定
+    输出:
+        log_tpop: (N,) float32 = log1p(列和)
+        a_rel:    (N, N) float32，标准化并 clip 到 [-8, 8]，对角线为 0
+    """
+    A = np.asarray(A, dtype=np.float64)
+    if A.ndim != 2 or A.shape[0] != A.shape[1]:
+        raise ValueError(f'A must be square, got {A.shape}')
+    n = A.shape[0]
+    col_sum = A.sum(axis=0)
+    row_sum = A.sum(axis=1)
+    log_tpop = np.log1p(col_sum).astype(np.float32)
+
+    total = float(A.sum()) + eps
+    pmi = (np.log(A + eps)
+           - np.log(row_sum[:, None] + eps)
+           - np.log(col_sum[None, :] + eps)
+           + np.log(total))
+
+    dist = np.asarray(dist_km, dtype=np.float64)
+    if dist.shape != A.shape:
+        raise ValueError(f'dist_km shape {dist.shape} != A shape {A.shape}')
+    finite = np.isfinite(dist)
+    residual = pmi.copy()
+    if np.any(finite):
+        sample = dist[finite]
+        bins = np.percentile(sample, np.linspace(0.0, 100.0, n_dist_bins + 1))
+        bins[0] = -np.inf
+        bins[-1] = np.inf
+        # 分位重复时 digitize 仍给出 0..n_dist_bins-1
+        bin_id = np.digitize(dist, bins[1:-1], right=True)
+        for b in range(n_dist_bins):
+            mask = (bin_id == b) & finite
+            if np.any(mask):
+                residual[mask] -= pmi[mask].mean()
+
+    std = float(residual.std())
+    if std > eps:
+        residual = residual / std
+    np.fill_diagonal(residual, 0.0)
+    residual = np.clip(residual, -8.0, 8.0).astype(np.float32)
+    if residual.shape != (n, n):
+        raise ValueError('internal shape error in decompose_graph_adj')
+    return log_tpop, residual
+
+
+def fill_graph_transition_tables(table, adj_path, node_feats_path, poi_id2idx):
+    """读 graph_A.csv，按 POI id 对齐到因果词表，写入 log_tpop / a_rel。
+
+    graph_A 行序 = graph_X.csv 行序。因果词表也来自 graph_X，但 val/test
+    多出来的点（若有）会对不上，对不上的行/列保持 0。
+
+    找不到邻接矩阵时保持全 0，训练仍能跑，只是没有转移先验。
+
+    输入:
+        table: PoiConfounderTable（已有 dist_km）
+        adj_path: graph_A.csv
+        node_feats_path: graph_X.csv（用来把 A 的行号映射到 poi_id2idx）
+        poi_id2idx: {POI 字符串: 0..N-1}
+    输出:
+        同一个 table（原地写入），以及 stats dict
+    """
+    n = int(table.num_pois)
+    if table.log_tpop is None:
+        table.log_tpop = np.zeros(n, dtype=np.float32)
+    if table.a_rel is None:
+        table.a_rel = np.zeros((n, n), dtype=np.float32)
+
+    if not adj_path or not os.path.isfile(adj_path):
+        return {'loaded': False, 'n_mapped': 0, 'reason': 'missing_adj'}
+
+    from dataloader import load_graph_adj_mtx
+    A_raw = np.asarray(load_graph_adj_mtx(adj_path), dtype=np.float64)
+    if A_raw.ndim != 2 or A_raw.shape[0] != A_raw.shape[1]:
+        return {'loaded': False, 'n_mapped': 0, 'reason': f'bad_shape:{A_raw.shape}'}
+
+    n_g = int(A_raw.shape[0])
+    graph_ids = None
+    if node_feats_path and os.path.isfile(node_feats_path):
+        gx = pd.read_csv(node_feats_path)
+        graph_ids = list(gx.iloc[:, 0].tolist())
+
+    A_full = np.zeros((n, n), dtype=np.float64)
+    if graph_ids is None:
+        n_use = min(n, n_g)
+        A_full[:n_use, :n_use] = A_raw[:n_use, :n_use]
+        n_mapped = n_use
+    else:
+        mapped_g, mapped_c = [], []
+        for gi, poi in enumerate(graph_ids):
+            if gi >= n_g:
+                break
+            idx = poi_id2idx.get(poi)
+            if idx is None:
+                idx = poi_id2idx.get(str(poi))
+            if idx is not None:
+                mapped_g.append(gi)
+                mapped_c.append(int(idx))
+        n_mapped = len(mapped_g)
+        if n_mapped:
+            g_idx = np.asarray(mapped_g, dtype=np.int64)
+            c_idx = np.asarray(mapped_c, dtype=np.int64)
+            A_full[np.ix_(c_idx, c_idx)] = A_raw[np.ix_(g_idx, g_idx)]
+
+    log_tpop, a_rel = decompose_graph_adj(A_full, table.dist_km)
+    table.log_tpop = log_tpop
+    table.a_rel = a_rel
+    return {
+        'loaded': True,
+        'n_mapped': int(n_mapped),
+        'n_graph': n_g,
+        'n_pois': n,
+        'nnz': int((A_full > 0).sum()),
+        'tpop_max': float(log_tpop.max()),
+        'a_rel_std': float(a_rel.std()),
+    }
 
 
 def load_nodes_df(path):

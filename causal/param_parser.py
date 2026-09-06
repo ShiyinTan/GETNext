@@ -3,7 +3,8 @@
 排版故意贴近 GETNext 的 param_parser.py，所以 `--epochs / --batch / --lr / --no-cuda`
 这些用法是一样的。多出来的是因果相关开关（lambda_*、距离/热度分桶）。
 
-没有 GCN / NodeAttnMap 相关参数：附录 D 用 nn.Embedding 当 e_p，混杂 C 不进 token。
+没有把原始 graph_A 灌进 GCN / token：附录 D 用 nn.Embedding 当 e_p；
+graph_A 只拆成查表先验（转移热度进 s_conf，残差相关仅 factual）。
 在仓库根目录运行: python causal/train.py --help
 
 本文件没有 tensor：输入是命令行字符串，输出是 argparse.Namespace（全是标量）。
@@ -39,7 +40,7 @@ def parameter_parser():
     parser.add_argument('--no-cuda', action='store_true', default=False,
                         help='即使有 GPU 也强制用 CPU')
 
-    # ---- 数据：CSV 格式和 GETNext 相同；不用 graph_A.csv ----
+    # ---- 数据：CSV 格式和 GETNext 相同；graph_A 只拆成查表先验，不进 GCN ----
     parser.add_argument('--data-train', type=str, default='dataset/NYC/NYC_train.csv',
                         help='训练轨迹 CSV')
     parser.add_argument('--data-val', type=str, default='dataset/NYC/NYC_val.csv',
@@ -51,7 +52,9 @@ def parameter_parser():
     parser.add_argument('--no-eval-test', dest='eval_test', action='store_false',
                         help='训练时不评 test')
     parser.add_argument('--data-node-feats', type=str, default='dataset/NYC/graph_X.csv',
-                        help='地点表：id、签到次数、类别、经纬度（不用邻接矩阵）')
+                        help='地点表：id、签到次数、类别、经纬度')
+    parser.add_argument('--data-adj-mtx', type=str, default='dataset/NYC/graph_A.csv',
+                        help='轨迹流邻接矩阵。拆成转移热度(进 s_conf)和残差相关(仅 factual)，不灌进 h_z')
     parser.add_argument('--short-traj-thres', type=int, default=2,
                         help='短于该长度的轨迹丢掉（和 GETNext 一样）')
     parser.add_argument('--time-units', type=int, default=48,
@@ -99,14 +102,16 @@ def parameter_parser():
                         help='重建：让 h_c 能够猜出混杂 C')
     parser.add_argument('--lambda-cat', type=float, default=0.05,
                         help='从 h_z 预测下一站类别（D.4.2b）；设 0 关闭')
-    parser.add_argument('--lambda-time', type=float, default=0.0,
-                        help='时间回归（GETNext 风格），默认关闭')
+    parser.add_argument('--lambda-time', type=float, default=10.0,
+                        help='时间回归 MSE（和 GETNext --time-loss-weight 一样，默认 10；不是 CE）')
     parser.add_argument('--conf-aux-ce', action='store_true', default=False,
                         help='再给 s_conf 一个很弱的 CE；默认关，避免混杂通道太强')
     parser.add_argument('--align-alpha', type=float, default=0.2,
                         help='手工先验：-alpha × 距离(公里)')
     parser.add_argument('--align-beta', type=float, default=0.3,
-                        help='手工先验：+beta × log(1+热度)，把流行度推进混杂通道')
+                        help='手工先验：+beta × log(1+签到热度)，把流行度推进混杂通道')
+    parser.add_argument('--align-gamma', type=float, default=0.3,
+                        help='手工先验：+gamma × log(1+转移入度)，把 graph_A 热度推进 s_conf')
 
     # ---- 分数怎么加：默认全 1 = 附录 D 直接相加。不要六个一起网格搜索 ----
     # 真正值得调的通常只有 --w-conf。内部四项给消融 / 预测时微调用。
@@ -117,11 +122,15 @@ def parameter_parser():
     parser.add_argument('--w-acc', type=float, default=1.0,
                         help='s_conf 里距离项权重。设 0 = 消融距离；训练请保持 1')
     parser.add_argument('--w-pop', type=float, default=1.0,
-                        help='s_conf 里热度项权重。设 0 = 消融热度；训练请保持 1')
+                        help='s_conf 里签到热度项权重。设 0 = 消融签到热度；训练请保持 1')
+    parser.add_argument('--w-tpop', type=float, default=1.0,
+                        help='s_conf 里转移入度热度 A_pop 权重。设 0 = 消融 graph_A 热度')
     parser.add_argument('--w-area', type=float, default=1.0,
                         help='s_conf 里区域项权重。设 0 = 消融区域')
     parser.add_argument('--w-ctx', type=float, default=1.0,
                         help='s_conf 里 <W_c h_c, ψ(p)> 情境项权重。设 0 = 消融情境头')
+    parser.add_argument('--w-rel', type=float, default=1.0,
+                        help='factual 里残差相关 s_rel 权重。设 0 = 不要 A_rel；deconf 本来就不加')
 
     # ---- 训练超参（含义和 GETNext 相同）----
     parser.add_argument('--batch', type=int, default=20, help='一个 batch 几条轨迹')

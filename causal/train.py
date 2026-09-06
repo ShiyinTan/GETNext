@@ -5,9 +5,10 @@
   → 每个 epoch 在验证集上看 Acc@k / mAP@20 / MRR，并立刻在测试集上再评一次（方便看能力；选 checkpoint 仍只用 val） → 存最好的 checkpoint
 
 和 GETNext 不同、按因果规格改掉的部分：
-  - 不用 GCN、不用 NodeAttnMap
+  - 不用 GCN、不用 NodeAttnMap（e_p 仍是 nn.Embedding）
+  - graph_A 拆成转移热度（进 s_conf）和残差相关（仅 factual 的 s_rel）
   - 混杂 C 不进 Transformer token
-  - 损失是「总分 CE + 兴趣环带 + 混杂对齐 + 对抗 + 重建」
+  - 损失是「总分 CE + 兴趣环带 + 混杂对齐 + 对抗 + 重建 + 时间 MSE」
   - 验证时同时报 factual（总分）和 deconf（只用兴趣分）两套指标
     选 checkpoint 只用 factual，避免用去混淆分数去刷写实 Acc（§7）
 
@@ -39,11 +40,13 @@ train_df / val_df / test_df = 签到明细，一行一次 check-in，不是一�
   → Dataset 切成 输入 poi=[p0,p1,p2]  标签 y=[p1,p2,p3]
 
 nodes_df = 地点表，一行一个 POI，行顺序就是模型里的下标 0..N-1。
-  文件: dataset/NYC/graph_X.csv （NYC 约 4980 行，不是邻接矩阵；邻接矩阵 graph_A.csv 这里不用）
+  文件: dataset/NYC/graph_X.csv （NYC 约 4980 行，不是邻接矩阵）
     node_name/poi_id   和 train_df['POI_id'] 同一套字符串
     checkin_cnt        兜底热度；有训练集时会被 train 里的次数覆盖
     poi_catid          类别字符串，如 '4bf58dd8d48988d11d941735'（约 300 类）
     latitude / longitude
+  邻接矩阵 graph_A.csv 行序与 graph_X 相同；这里不送进 GCN，只拆成
+    log_tpop（目的地入度，进 s_conf）和 a_rel（残差相关，仅 factual）。
 """
 import logging
 import os
@@ -66,7 +69,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from causal.features import build_poi_table, fill_transition_priors, load_nodes_df
+from causal.features import (
+    build_poi_table,
+    fill_graph_transition_tables,
+    fill_transition_priors,
+    load_nodes_df,
+)
 from causal.metrics import batch_last_step_metrics
 from causal.model import CausalNextPOI
 from causal.param_parser import parameter_parser
@@ -331,7 +339,7 @@ def compute_losses(model, batch, buffers, args, ce):
       + λ_adv   * 用 h_z 猜 C（GRL 已在模型里反转梯度）
       + λ_recon * 用 h_c 重建 C
       + λ_cat   * 从 h_z 猜下一站类别（可选）
-      + λ_time  * 时间 MSE（默认权重 0）
+      + λ_time  * 时间 MSE（默认 10，与 GETNext --time-loss-weight 对齐）
 
     输入:
         model: CausalNextPOI
@@ -363,7 +371,9 @@ def compute_losses(model, batch, buffers, args, ce):
     loss_pref = ce(s_ring.transpose(1, 2), y)
 
     # D.4.3 混杂通道：s_conf 去贴「近则高、热则高、同区则高」的手工分（不反传到 g̃）
-    g_tilde = model.g_tilde(poi, buffers, args.align_alpha, args.align_beta).detach()
+    g_tilde = model.g_tilde(
+        poi, buffers, args.align_alpha, args.align_beta,
+        getattr(args, 'align_gamma', 0.3)).detach()
     valid = (y >= 0).unsqueeze(-1).float()
     denom = valid.sum() * s_conf.size(-1)
     # 对齐的是打分用的 s_conf（已含内部 w_*）。训练时内部权重请保持 1，以免和 g_* 对打。
@@ -462,11 +472,14 @@ def train(args):
     logging.info(f' device   : {args.device}')
     logging.info(f' epochs   : {args.epochs}  batch={args.batch}  lr={args.lr}')
     logging.info(f' lambdas  : pref={args.lambda_pref} conf={args.lambda_conf} '
-                 f'adv={args.lambda_adv} recon={args.lambda_recon}')
+                 f'adv={args.lambda_adv} recon={args.lambda_recon} '
+                 f'cat={args.lambda_cat} time={args.lambda_time}')
     logging.info(f' score w  : pref={args.w_pref} conf={args.w_conf} '
-                 f'acc={args.w_acc} pop={args.w_pop} area={args.w_area} ctx={args.w_ctx}')
+                 f'acc={args.w_acc} pop={args.w_pop} tpop={args.w_tpop} '
+                 f'area={args.w_area} ctx={args.w_ctx} rel={args.w_rel}')
     logging.info(f' train    : {args.data_train}')
     logging.info(f' val      : {args.data_val}')
+    logging.info(f' graph_A  : {args.data_adj_mtx}')
     if args.eval_test:
         logging.info(f' test     : {args.data_test}  (monitor only; ckpt uses val)')
     logging.info(SEP)
@@ -505,6 +518,17 @@ def train(args):
     user_id2idx = dict(zip(user_ids, range(len(user_ids))))  # '470' → 12；NYC 训练集约 1047 人
 
     table = build_poi_table(nodes_df, train_df, args, poi_id2idx)
+    graph_stats = fill_graph_transition_tables(
+        table, args.data_adj_mtx, args.data_node_feats, poi_id2idx)
+    if graph_stats.get('loaded'):
+        logging.info(
+            f'        graph_A loaded: mapped={graph_stats["n_mapped"]}/{graph_stats["n_pois"]} '
+            f'nnz={graph_stats["nnz"]} tpop_max={graph_stats["tpop_max"]:.3f} '
+            f'a_rel_std={graph_stats["a_rel_std"]:.3f}')
+    else:
+        logging.warning(
+            f'graph_A not used ({graph_stats.get("reason", "unknown")}); '
+            f'log_tpop/a_rel stay zero ({args.data_adj_mtx})')
 
     # ---------- 2. Dataset / DataLoader（验证集丢掉训练没见过的用户）----------
     logging.info('[2/4] Building dataloaders...')
@@ -578,6 +602,8 @@ def train(args):
             'num_areas': table.num_areas,
             'num_acc_bins': table.num_acc_bins,
             'num_pop_bins': table.num_pop_bins,
+            'log_tpop': table.log_tpop,
+            'a_rel': table.a_rel,
         }, f)
 
     # ---------- 4. epoch 循环 ----------

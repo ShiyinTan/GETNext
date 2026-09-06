@@ -2,10 +2,11 @@
 
 对照 GETNext，这里按因果规格改掉的地方（冲突以附录 D 为准）：
   1. 地点向量 e_p 用普通查表 nn.Embedding，不用 GCN（附录 A / D.8：
-     GCN 会把热度、转移次数再灌进表征，和混杂通道重复计算）
-  2. 不再把 NodeAttnMap 加到 POI 分数上（那也是近邻先验）
+     不把原始 graph_A 无约束灌进 h_z / e_p）
+  2. 不再把 NodeAttnMap 加到 POI 分数上
   3. 混杂 C 不拼进 Transformer 的输入 token（D.3.4，避免泄漏）
-  4. 排序用 s = s_pref + s_conf，而不是一个混在一起的 CE 头
+  4. 排序：factual = s_pref + s_conf(含转移热度 A_pop) + s_rel(A 残差相关)
+     deconf = s_pref（或干预后的 s_conf，不含 s_rel）
 
 Time2Vec / 用户嵌入 / 类别嵌入仍从原来的 model.py 借用，只读不改。
 
@@ -161,10 +162,11 @@ class CausalNextPOI(nn.Module):
               cat_embedding: (n_cat, cat_embed_dim)
               split_z: d → d_z ； split_c: d → d_c
               g_acc.weight: (K, 1)
+              g_pop / g_tpop / g_rel: Linear(1,1)
               psi.weight: (N, d_c)
               adv_*: d_z → K/P/A/H ； recon_*: d_c → K/P/A/H
               cat_head: d_z → n_cat ； time_head: d → 1
-              w_pref / w_conf / w_acc / w_pop / w_area / w_ctx: 标量，默认 1
+              w_pref / w_conf / w_acc / w_pop / w_tpop / w_area / w_ctx / w_rel: 标量，默认 1
         """
         super().__init__()
         self.num_pois = num_pois
@@ -202,9 +204,11 @@ class CausalNextPOI(nn.Module):
         self.split_z = nn.Sequential(nn.Linear(d_model, self.hz_dim), nn.LeakyReLU(0.2))
         self.split_c = nn.Sequential(nn.Linear(d_model, self.hc_dim), nn.LeakyReLU(0.2))
 
-        # ---- D.3.3 混杂通道：距离 / 热度 / 区域 三个查表分，再加 h_c 与地点的匹配 ----
+        # ---- D.3.3 混杂通道：距离 / 签到热度 / 转移热度 / 区域，再加 h_c 匹配 ----
         self.g_acc = nn.Embedding(table.num_acc_bins, 1)   # 每个距离桶一个标量分
-        self.g_pop = nn.Linear(1, 1)                       # log 热度 → 标量分
+        self.g_pop = nn.Linear(1, 1)                       # log 签到热度 → 标量分
+        self.g_tpop = nn.Linear(1, 1)                      # log 转移入度热度 A_pop → 标量分
+        self.g_rel = nn.Linear(1, 1)                       # A_rel 残差相关 → 标量分（仅 factual）
         self.area_emb = nn.Embedding(table.num_areas, 16)  # 区域向量
         self.g_area = nn.Linear(1, 1)                      # 起点·终点区域相似度 → 标量
         # <W_c h_c, ψ(p)>：查表覆盖不到的情境混杂（例如时段），可选但规格里有
@@ -225,10 +229,14 @@ class CausalNextPOI(nn.Module):
         self.cat_head = nn.Linear(self.hz_dim, num_cats)
         self.time_head = nn.Linear(d_model, 1)
 
-        # 混杂头从 0 起步，先让兴趣通道有机会学，再由 L_conf 把近/热推进 s_conf
+        # 混杂头从 0 起步，先让兴趣通道有机会学，再由 L_conf 把近/热/转移热度推进 s_conf
         nn.init.zeros_(self.g_acc.weight)
         nn.init.zeros_(self.g_pop.weight)
         nn.init.zeros_(self.g_pop.bias)
+        nn.init.zeros_(self.g_tpop.weight)
+        nn.init.zeros_(self.g_tpop.bias)
+        nn.init.zeros_(self.g_rel.weight)
+        nn.init.zeros_(self.g_rel.bias)
         nn.init.zeros_(self.g_area.weight)
         nn.init.zeros_(self.g_area.bias)
 
@@ -240,16 +248,18 @@ class CausalNextPOI(nn.Module):
         """从 args 读分数权重。缺省（旧 checkpoint）一律当 1。
 
         输入:
-            args: 有 w_pref / w_conf / w_acc / w_pop / w_area / w_ctx 的对象
+            args: 有 w_pref / w_conf / w_acc / w_pop / w_tpop / w_area / w_ctx / w_rel 的对象
         输出:
-            无返回。写入 self 上的 6 个标量 float。
+            无返回。写入 self 上的标量 float。
         """
         self.w_pref = float(getattr(args, 'w_pref', 1.0))
         self.w_conf = float(getattr(args, 'w_conf', 1.0))
         self.w_acc = float(getattr(args, 'w_acc', 1.0))
         self.w_pop = float(getattr(args, 'w_pop', 1.0))
+        self.w_tpop = float(getattr(args, 'w_tpop', 1.0))
         self.w_area = float(getattr(args, 'w_area', 1.0))
         self.w_ctx = float(getattr(args, 'w_ctx', 1.0))
+        self.w_rel = float(getattr(args, 'w_rel', 1.0))
 
     def _token_embed(self, poi_idx, time_feat, cat_idx, user_idx):
         """把一步的 (地点, 时间, 类别, 用户) 融合成 Transformer 的一个 token。
@@ -346,29 +356,33 @@ class CausalNextPOI(nn.Module):
         return dist_bin, dist_km, origin_area
 
     def _s_conf_from_phi(self, h_c, dist_bin, origin_area, buffers):
-        """混杂通道：四项先各自算出，再按 w_acc / w_pop / w_area / w_ctx 加权求和。
+        """混杂通道：距离 / 签到热度 / 转移热度 / 区域 / 情境，再按内部权重相加。
 
-        默认权重全是 1，等于附录 D 的直接相加。
-        返回的 s_conf 已经乘过内部权重；parts 里仍是未加权的原始项，
-        方便 deconf_do 替换热度后再 mix 一次。
+        默认权重全是 1。返回的 s_conf 已经乘过内部权重；parts 里仍是未加权项，
+        方便 deconf_do 替换热度后再 mix 一次。s_rel 不在这里，只加在 factual。
 
         输入:
             h_c:         (B, T, d_c)
             dist_bin:    (B, T, N) long
             origin_area: (B, T)    long
             buffers:
-                log_pop: (N,)
+                log_pop / log_tpop: (N,)
                 area_id: (N,)
         输出:
             s_conf: (B, T, N)
             parts: dict
                 s_acc:  (B, T, N)  距离桶查表分
-                s_pop:  (1, 1, N)  热度分，与轨迹无关，广播到 B,T
+                s_pop:  (1, 1, N)  签到热度分
+                s_tpop: (1, 1, N)  转移入度热度分
                 s_area: (B, T, N)  起点区域 · 终点区域
                 s_ctx:  (B, T, N)  <W_c h_c, ψ(p)>
         """
         s_acc = self.g_acc(dist_bin.clamp(min=0)).squeeze(-1)             # (B, T, N)
         s_pop = self.g_pop(buffers['log_pop'].unsqueeze(-1)).squeeze(-1)  # (N,)，与轨迹无关
+        if 'log_tpop' in buffers:
+            s_tpop = self.g_tpop(buffers['log_tpop'].unsqueeze(-1)).squeeze(-1)
+        else:
+            s_tpop = torch.zeros_like(s_pop)
         dest_area_e = self.area_emb(buffers['area_id'])                   # (N, 16)
         origin_area_e = self.area_emb(origin_area.clamp(min=0))           # (B, T, 16)
         # 起点区域向量 · 每个终点区域向量 → 同区更高
@@ -379,30 +393,53 @@ class CausalNextPOI(nn.Module):
         parts = {
             's_acc': s_acc,
             's_pop': s_pop_b,
+            's_tpop': s_tpop.view(1, 1, -1),
             's_area': s_area,
             's_ctx': ctx,
         }
         return self._mix_s_conf(parts), parts
 
     def _mix_s_conf(self, parts):
-        """s_conf = w_acc*距离 + w_pop*热度 + w_area*区域 + w_ctx*情境。默认权重全是 1。
+        """s_conf = 距离 + 签到热度 + 转移热度 + 区域 + 情境。默认权重全是 1。
 
         输入:
-            parts: dict，未乘权重的四项，形状见 _s_conf_from_phi
+            parts: dict，未乘权重的各项，形状见 _s_conf_from_phi
         输出:
             s_conf: (B, T, N)
         """
-        return (self.w_acc * parts['s_acc']
-                + self.w_pop * parts['s_pop']
-                + self.w_area * parts['s_area']
-                + self.w_ctx * parts['s_ctx'])
+        s = (self.w_acc * parts['s_acc']
+             + self.w_pop * parts['s_pop']
+             + self.w_area * parts['s_area']
+             + self.w_ctx * parts['s_ctx'])
+        if 's_tpop' in parts:
+            s = s + self.w_tpop * parts['s_tpop']
+        return s
 
-    def _combine_scores(self, s_pref, s_conf):
-        """总分 s = w_pref * s_pref + w_conf * s_conf。默认都是 1。
+    def _s_rel(self, origin_idx, buffers):
+        """残差转移相关 s_rel[b,t,j] = g_rel(A_rel[origin, j])。只应加在 factual 上。
+
+        输入:
+            origin_idx: (B, T) long
+            buffers: a_rel (N, N)
+        输出:
+            s_rel: (B, T, N)；没有 a_rel 时返回 None
+        """
+        if 'a_rel' not in buffers:
+            return None
+        valid = (origin_idx >= 0)
+        raw = buffers['a_rel'][origin_idx.clamp(min=0)]  # (B, T, N)
+        s_rel = self.g_rel(raw.unsqueeze(-1)).squeeze(-1)
+        return s_rel * valid.to(dtype=s_rel.dtype).unsqueeze(-1)
+
+    def _combine_scores(self, s_pref, s_conf, s_rel=None):
+        """factual: w_pref*s_pref + w_conf*s_conf + w_rel*s_rel；deconf 不传 s_rel。
 
         输入 / 输出: 均为 (B, T, N)
         """
-        return self.w_pref * s_pref + self.w_conf * s_conf
+        s = self.w_pref * s_pref + self.w_conf * s_conf
+        if s_rel is not None:
+            s = s + self.w_rel * s_rel
+        return s
 
     def score(self, h_z, h_c, origin_idx, buffers, mode='factual',
               bar_acc_bin=None, bar_pop_log=None):
@@ -422,10 +459,10 @@ class CausalNextPOI(nn.Module):
             dist_km:(B, T, N)  真实公里数（评估切片用，不受 mode 改写）
 
         mode 含义（人话）：
-          factual     用真实距离和热度，回答「现实约束下下一站会去哪」
-          deconf_pref 只用兴趣分，回答「若远近热度都不管，兴趣指向谁」（规格首选）
-          deconf_do   把所有候选的距离桶、热度换成同一个干预值 c_bar
-          deconf_sum  对近/热做边缘化：排序时去掉会随候选变化的距离/热度头
+          factual     真实距离/热度 + 转移热度 + 残差相关
+          deconf_pref 只用兴趣分（规格首选）
+          deconf_do   距离桶 / 签到热度 / 转移热度都换成同一个干预值；不加 s_rel
+          deconf_sum  丢掉随候选变化的距离/热度/转移热度头；不加 s_rel
         """
         s_pref = self._s_pref(h_z)
         dist_bin, dist_km, origin_area = self._gather_origin_tables(origin_idx, buffers)
@@ -435,8 +472,8 @@ class CausalNextPOI(nn.Module):
             return self._combine_scores(s_pref, s_conf), s_pref, s_conf, dist_km
 
         if mode == 'deconf_do':
-            # do(C=c_bar)：每个候选都用同一个距离桶，热度换成常数
-            # 这样「更近 / 更热」不再能拉开名次
+            # do(C=c_bar)：每个候选都用同一个距离桶，热度/转移热度换成常数
+            # 这样「更近 / 更热」不再能拉开名次；s_rel 不加
             if bar_acc_bin is None:
                 bar_acc_bin = 0
             dist_bin = torch.full_like(dist_bin, int(bar_acc_bin))
@@ -449,29 +486,34 @@ class CausalNextPOI(nn.Module):
                 ).view(1, 1, 1)
             parts = dict(parts)
             parts['s_pop'] = pop_const.expand_as(parts['s_pop'])
+            if 's_tpop' in parts and 'log_tpop' in buffers:
+                tpop_const = self.g_tpop(buffers['log_tpop'].mean().view(1, 1)).view(1, 1, 1)
+                parts['s_tpop'] = tpop_const.expand_as(parts['s_tpop'])
             s_conf = self._mix_s_conf(parts)
             return self._combine_scores(s_pref, s_conf), s_pref, s_conf, dist_km
 
         if mode == 'deconf_sum':
-            # 若给所有候选同一个 g_acc / 平均 g_pop，名次不变，等价于丢掉这两项
+            # 丢掉随候选变化的 g_acc / g_pop / g_tpop；不加 s_rel
             _, parts = self._s_conf_from_phi(h_c, dist_bin, origin_area, buffers)
             s_conf = self.w_area * parts['s_area'] + self.w_ctx * parts['s_ctx']
             return self._combine_scores(s_pref, s_conf), s_pref, s_conf, dist_km
 
-        # factual：真实 C(p)
+        # factual：真实 C(p) + 残差相关
         s_conf, _ = self._s_conf_from_phi(h_c, dist_bin, origin_area, buffers)
-        return self._combine_scores(s_pref, s_conf), s_pref, s_conf, dist_km
+        s_rel = self._s_rel(origin_idx, buffers)
+        return self._combine_scores(s_pref, s_conf, s_rel), s_pref, s_conf, dist_km
 
-    def g_tilde(self, origin_idx, buffers, alpha, beta):
+    def g_tilde(self, origin_idx, buffers, alpha, beta, gamma=0.3):
         """手工先验混杂分 g̃（附录 D.4.3，训练时 stop-grad）。
 
-        越近越高（-α × 公里），越热越高（+β × log热度），同区域再加一点。
-        用来把「近/热/同区」从兴趣通道里挤到 s_conf。
+        越近越高（-α × 公里），签到越热 / 转移越热越高，同区域再加一点。
+        转移热度 log_tpop 也放进 g̃，把 A_pop 留在 s_conf；不加 A_rel
+        （残差相关不是混杂 C，只走 factual 的 s_rel）。
 
         输入:
             origin_idx: (B, T) long
-            buffers: dist_km (N,N), log_pop (N,), area_id (N,)
-            alpha, beta: 标量
+            buffers: dist_km (N,N), log_pop (N,), log_tpop (N,), area_id (N,)
+            alpha, beta, gamma: 标量
         输出:
             g_tilde: (B, T, N)
         """
@@ -480,7 +522,10 @@ class CausalNextPOI(nn.Module):
         origin_area = buffers['area_id'][origin_idx.clamp(min=0)]
         dest_area = buffers['area_id'].view(1, 1, -1)
         same_area = (origin_area.unsqueeze(-1) == dest_area).float()
-        return (-alpha * dist_km) + beta * log_pop + 0.15 * same_area
+        tpop_term = 0.0
+        if 'log_tpop' in buffers:
+            tpop_term = gamma * buffers['log_tpop'].view(1, 1, -1)
+        return (-alpha * dist_km) + beta * log_pop + tpop_term + 0.15 * same_area
 
     def adv_logits(self, h_z, lambd):
         """用 GRL(h_z) 去猜 C 的四个桶。分类器想猜对，编码器被反转梯度逼着猜不对。
