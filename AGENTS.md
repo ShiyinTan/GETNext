@@ -5,7 +5,7 @@
 This repo trains GETNext (next-POI recommendation) on the NYC check-in dataset.
 
 ### Environment
-- Cloud VM is **CPU-only**. Use `requirements-cpu.txt` and the CPU PyTorch wheel.
+- Python **3.10–3.12** (3.12 verified). Cloud VM is **CPU-only**. Use `requirements-cpu.txt` and the CPU PyTorch wheel.
 - Setup is defined in `.cursor/environment.json` (default Cursor image + install script). No custom Dockerfile.
 - `scripts/setup_cloud_env.sh` creates `.venv`, installs CPU torch, and unpacks NYC.
 - Always `source .venv/bin/activate` before running Python if the shell is fresh.

@@ -17,8 +17,16 @@ bash scripts/train_cpu_smoke.sh
 **GPU (local machine with CUDA):**
 
 ```bash
-pip install -r requirements.txt
+# Same `python3 -m venv` as CPU. Do not reuse a CPU .venv — pip will skip the
+# CUDA wheel (2.4.1+cpu and 2.4.1+cu121 look like the same version).
+python3 -m venv .venv            # or .venv-gpu if .venv is already CPU
+source .venv/bin/activate
+python -m pip install --upgrade pip
+# Example CUDA 12.1; pick cu118/cu121/cu124 at https://pytorch.org/get-started/locally/
+python -m pip install --index-url https://download.pytorch.org/whl/cu121 "torch>=2.1,<2.5"
+python -m pip install -r requirements.txt
 unzip -o dataset/NYC.zip -d dataset/
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"  # expect +cu121 True
 python train.py --batch 16 --epochs 200 --name nyc-gpu --exist-ok
 python predict.py \
   --checkpoint runs/train/nyc-gpu/checkpoints/best_epoch.state.pt \
@@ -29,11 +37,11 @@ python predict.py \
 
 ## Installation
 
-### GPU
+**Python:** 3.10, 3.11, or 3.12 (3.12 verified). Do not use 3.9- or 3.13+.
 
-```bash
-pip install -r requirements.txt
-```
+`torch` is **not** listed in `requirements.txt` because CPU and CUDA wheels come from different indexes. Install torch first, then the requirements file.
+
+CPU and GPU both start with `python3 -m venv`. They must not share one venv: a venv can hold only one torch build. If `.venv` already has `2.4.1+cpu`, installing `2.4.1+cu121` into it is a no-op. Use `.venv` for whichever this machine is, or `.venv-cpu` and `.venv-gpu` if you need both.
 
 ### CPU-only
 
@@ -47,7 +55,20 @@ Or manually:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements-cpu.txt
+python -m pip install --upgrade pip
+python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.1,<2.5"
+python -m pip install -r requirements-cpu.txt
+```
+
+### GPU (CUDA)
+
+```bash
+python3 -m venv .venv            # use .venv-gpu if .venv is already a CPU env
+source .venv/bin/activate
+python -m pip install --upgrade pip
+# Example: CUDA 12.1. Change cu121 to match your driver.
+python -m pip install --index-url https://download.pytorch.org/whl/cu121 "torch>=2.1,<2.5"
+python -m pip install -r requirements.txt
 ```
 
 Always activate the venv in a new shell:
@@ -56,9 +77,17 @@ Always activate the venv in a new shell:
 source .venv/bin/activate
 ```
 
+Check the install:
+
+```bash
+python -c "import torch, numpy, pandas; print(torch.__version__, torch.cuda.is_available())"
+# CPU venv:  2.4.1+cpu   False
+# GPU venv:  2.4.1+cu121 True
+```
+
 ## Requirements
 
-See `requirements.txt` (GPU) or `requirements-cpu.txt` (CPU). Key packages: PyTorch, NumPy, pandas, scikit-learn, PyYAML, tqdm.
+See `requirements.txt` (shared packages) and `requirements-cpu.txt` (includes the former). Key packages: NumPy, pandas, scikit-learn, SciPy, PyYAML, tqdm, networkx. Install PyTorch separately as above.
 
 ## Prepare data
 

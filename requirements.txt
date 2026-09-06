@@ -1,12 +1,29 @@
-torch==1.7.1
-numpy==1.19.2
-prettytable==2.0.0
-matplotlib==3.3.4
-scipy==1.6.1
-torch_summary==1.4.5
-tqdm==4.58.0
-pandas==1.1.5
-data==0.4
-PyYAML==6.0
-scikit_learn==1.0.2
-torchsummary==1.5.1
+# GETNext + causal next-POI
+# Python: 3.10, 3.11, or 3.12 (3.12 verified). Not 3.9- and not 3.13+.
+#
+# Torch is installed separately (CPU vs CUDA wheels use different indexes):
+#   CPU:  pip install "torch>=2.1,<2.5" --index-url https://download.pytorch.org/whl/cpu
+#   GPU:  pip install "torch>=2.1,<2.5" --index-url https://download.pytorch.org/whl/cu121
+#         (pick cu118 / cu121 / cu124 from https://pytorch.org/get-started/locally/)
+# Do not put CPU and CUDA torch in the same venv: pip treats 2.4.1+cpu and
+# 2.4.1+cu121 as the same version, so a second install is a no-op. Use .venv
+# for one machine, or .venv-cpu and .venv-gpu if you need both.
+#
+# Packages actually imported by this repo:
+#   numpy, pandas, tqdm, PyYAML  — train / predict (GETNext and causal)
+#   scikit-learn                 — GETNext OneHotEncoder
+#   scipy                        — utils.calculate_laplacian_matrix (eigsh)
+#   networkx                     — build_graph.py
+#
+# Dropped from the original paper freeze (unused or uninstallable on modern Python):
+#   torch==1.7.1, numpy==1.19.2, pandas==1.1.5, scipy==1.6.1, matplotlib==3.3.4,
+#   prettytable, torch_summary, torchsummary, data==0.4 (unrelated PyPI package),
+#   PyYAML==6.0 (6.0 often fails to build; use 6.0.1+).
+
+numpy>=1.24,<2.1
+pandas>=1.5,<2.3
+scipy>=1.10,<1.14
+scikit-learn>=1.2,<1.6
+PyYAML>=6.0.1
+tqdm>=4.65
+networkx>=3.0

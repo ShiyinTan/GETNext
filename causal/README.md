@@ -138,25 +138,125 @@ CSV trajectories
 
 ---
 
-## Setup
+## 安装环境（完整步骤）
 
-Same environment as GETNext.
+因果代码和 GETNext **共用同一套环境**，没有单独的 `causal/requirements.txt`。始终在**仓库根目录**执行下面的命令。
 
-**CPU (Cursor Cloud):**
+### Python 版本
+
+| 项 | 说明 |
+|--|--|
+| 支持 | **3.10 / 3.11 / 3.12**（本仓库在 3.12 上验证） |
+| 不要用 | 3.9 及以下。原论文 `requirements.txt` 钉的是 `torch==1.7.1` + `numpy==1.19.2`，在现代 Python 上**没有轮子、装不上** |
+| 不要用 | **3.13+**（`torch>=2.1,<2.5` 没有对应 wheel） |
+
+只跑 `pip install -r requirements.txt` **不够**：`torch` 不在该文件里，必须按 CPU / GPU 先装对应 wheel。
+
+原论文 freeze 里还有这些问题，已经从仓库里删掉：`data==0.4`（无关的 PyPI 包，代码从未 import）、`prettytable` / `matplotlib` / `torch_summary` / `torchsummary`（未使用）、`PyYAML==6.0`（6.0 在新 Python 上经常编不过，改用 `>=6.0.1`）。缺少的 `networkx`（`build_graph.py`）已补上。
+
+### 1. 建虚拟环境
+
+GPU 和 CPU **都是** `python3 -m venv`，命令一样。冲突的不是 Python，是 **同一个 venv 里只能有一份 `torch`**。
+
+| 你的机器 | 用哪个目录 | 装哪种 torch |
+|--|--|--|
+| 只有 CPU | `.venv` | CPU wheel（`2.4.1+cpu`） |
+| 只有 NVIDIA GPU | `.venv` | CUDA wheel（`2.4.1+cu121` 等） |
+| 同一台机器两种都要 | `.venv-cpu` **和** `.venv-gpu` | 分开建、分开激活 |
+
+不要把 CUDA torch 装进已经有 CPU torch 的 `.venv`：`2.4.1+cpu` 和 `2.4.1+cu121` 被 pip 当成同一版本，第二次 `pip install` 会提示 `Requirement already satisfied` 然后什么都不改。要用 GPU，要么新建 `.venv-gpu`，要么删掉旧环境再装。
+
+```bash
+cd /path/to/GETNext          # 仓库根目录，不是 causal/
+python3 -m venv .venv        # 只有一种机器：就用这个名字
+source .venv/bin/activate    # Windows: .venv\Scripts\activate
+python -m pip install --upgrade pip setuptools wheel
+python -c "import sys; print(sys.version)"   # 确认是 3.10–3.12
+```
+
+同一台机器要并存 CPU / GPU 时：
+
+```bash
+python3 -m venv .venv-cpu
+python3 -m venv .venv-gpu
+# 用 CPU：source .venv-cpu/bin/activate
+# 用 GPU：source .venv-gpu/bin/activate
+```
+
+### 2a. CPU（无 GPU / Cursor Cloud）
+
+推荐一键脚本（建 venv、装 CPU torch、装依赖、解压 NYC）：
 
 ```bash
 bash scripts/setup_cloud_env.sh
 source .venv/bin/activate
 ```
 
-**GPU:**
+手动等价步骤：
 
 ```bash
-pip install -r requirements.txt
+python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.1,<2.5"
+python -m pip install -r requirements-cpu.txt
 unzip -o dataset/NYC.zip -d dataset/
 ```
 
-Always run from the **repo root**.
+### 2b. GPU（本机 CUDA）
+
+先到 [pytorch.org](https://pytorch.org/get-started/locally/) 选和本机 CUDA 匹配的 index。例如 CUDA 12.1。
+
+若这台机器**只有 GPU**，继续用上面的 `.venv`。若已经为 CPU 建过 `.venv`，不要往里面再装 CUDA torch，另建 `.venv-gpu`：
+
+```bash
+python3 -m venv .venv-gpu          # 或：本机只有 GPU 时用 .venv
+source .venv-gpu/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install --index-url https://download.pytorch.org/whl/cu121 "torch>=2.1,<2.5"
+python -m pip install -r requirements.txt
+unzip -o dataset/NYC.zip -d dataset/
+```
+
+其它常见 index：`cu118`（CUDA 11.8）、`cu124`（CUDA 12.4）。不要用默认 PyPI 的 `torch` 来代替上面的 index（CPU 机器会下到巨大的 CUDA 包）。
+
+装好后版本字符串应带 `+cu121`（或你选的 CUDA），并且：
+
+```bash
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.device_count())"
+```
+
+有 GPU 时应打印 `True` 且 `device_count >= 1`。没有 NVIDIA 驱动的机器上，CUDA wheel 也能 import，但 `cuda.is_available()` 仍是 `False`，不能当训练验证。
+
+### 3. 确认装好了
+
+```bash
+python - <<'PY'
+import sys, torch, numpy, pandas, sklearn, yaml, tqdm, networkx, scipy
+print("python", sys.version.split()[0])
+print("torch ", torch.__version__, "cuda", torch.cuda.is_available())
+print("numpy ", numpy.__version__, "pandas", pandas.__version__)
+PY
+```
+
+CPU 环境：`torch` 版本带 `+cpu`，`cuda` 为 `False`。  
+GPU 环境：版本带 `+cu121`（或 `cu118` / `cu124`），`cuda` 为 `True`。
+
+新开 shell 时激活**当前要用的那个** venv（`.venv` / `.venv-cpu` / `.venv-gpu`）。
+
+### 4. 数据文件
+
+解压后至少要有：
+
+- `dataset/NYC/NYC_train.csv`
+- `dataset/NYC/NYC_val.csv`
+- `dataset/NYC/NYC_test.csv`
+- `dataset/NYC/graph_X.csv`（POI 表：坐标 / 类别；因果训练**不用** `graph_A.csv`）
+
+### 5. 跑通一次（可选）
+
+```bash
+bash causal/run_cpu_smoke.sh
+```
+
+成功后会在 `runs/causal/<name>/predictions/metrics.json` 写出指标。
 
 ---
 

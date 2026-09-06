@@ -5,6 +5,19 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 
+require_python() {
+  python3 - <<'PY'
+import sys
+v = sys.version_info
+if (v.major, v.minor) < (3, 10) or (v.major, v.minor) > (3, 12):
+    raise SystemExit(
+        f"Need Python 3.10–3.12 (found {sys.version.split()[0]}). "
+        "Create a 3.10/3.11/3.12 venv, then re-run this script."
+    )
+print(f"Python {sys.version.split()[0]}")
+PY
+}
+
 ensure_venv_capable() {
   # Default Cursor images may lack ensurepip / python3-venv.
   if python3 -c "import ensurepip" >/dev/null 2>&1; then
@@ -24,6 +37,7 @@ venv_usable() {
   [ -x .venv/bin/python ] && .venv/bin/python -c "import sys; raise SystemExit(0 if sys.prefix != sys.base_prefix else 1)" 2>/dev/null
 }
 
+require_python
 ensure_venv_capable
 
 # Prefer a project venv so we don't fight system Python / PEP 668.
@@ -58,8 +72,10 @@ if [ ! -f dataset/NYC/NYC_train.csv ]; then
 fi
 
 python - <<'PY'
-import torch
+import torch, numpy, pandas, sklearn, yaml, tqdm, networkx, scipy
+print("python", __import__("sys").version.split()[0])
 print("torch", torch.__version__, "cuda", torch.cuda.is_available(), "device", "cpu")
+print("numpy", numpy.__version__, "pandas", pandas.__version__, "sklearn", sklearn.__version__)
 PY
 
 # Persist venv activation for later agent shells when possible.

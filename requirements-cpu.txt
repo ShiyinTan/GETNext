@@ -1,9 +1,5 @@
-# CPU-friendly deps for smoke training / Cursor Cloud (modern PyTorch)
-numpy>=1.24,<2.1
-pandas>=1.5,<2.3
-scipy>=1.10,<1.14
-scikit-learn>=1.2,<1.6
-PyYAML>=6.0
-tqdm>=4.65
-networkx>=3.0
-matplotlib>=3.7
+# CPU / Cursor Cloud: same Python packages as requirements.txt.
+# Install CPU torch first, then this file:
+#   python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.1,<2.5"
+#   python -m pip install -r requirements-cpu.txt
+-r requirements.txt
