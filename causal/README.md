@@ -138,25 +138,90 @@ CSV trajectories
 
 ---
 
-## Setup
+## 安装环境（完整步骤）
 
-Same environment as GETNext.
+因果代码和 GETNext **共用同一套环境**，没有单独的 `causal/requirements.txt`。始终在**仓库根目录**执行下面的命令。
 
-**CPU (Cursor Cloud):**
+### Python 版本
+
+| 项 | 说明 |
+|--|--|
+| 支持 | **3.10 / 3.11 / 3.12**（本仓库在 3.12 上验证） |
+| 不要用 | 3.9 及以下。原论文 `requirements.txt` 钉的是 `torch==1.7.1` + `numpy==1.19.2`，在现代 Python 上**没有轮子、装不上** |
+| 不要用 | **3.13+**（`torch>=2.1,<2.5` 没有对应 wheel） |
+
+只跑 `pip install -r requirements.txt` **不够**：`torch` 不在该文件里，必须按 CPU / GPU 先装对应 wheel。
+
+原论文 freeze 里还有这些问题，已经从仓库里删掉：`data==0.4`（无关的 PyPI 包，代码从未 import）、`prettytable` / `matplotlib` / `torch_summary` / `torchsummary`（未使用）、`PyYAML==6.0`（6.0 在新 Python 上经常编不过，改用 `>=6.0.1`）。缺少的 `networkx`（`build_graph.py`）已补上。
+
+### 1. 建虚拟环境
+
+```bash
+cd /path/to/GETNext          # 仓库根目录，不是 causal/
+python3 -m venv .venv
+source .venv/bin/activate    # Windows: .venv\Scripts\activate
+python -m pip install --upgrade pip setuptools wheel
+python -c "import sys; print(sys.version)"   # 确认是 3.10–3.12
+```
+
+### 2a. CPU（无 GPU / Cursor Cloud）
+
+推荐一键脚本（建 venv、装 CPU torch、装依赖、解压 NYC）：
 
 ```bash
 bash scripts/setup_cloud_env.sh
 source .venv/bin/activate
 ```
 
-**GPU:**
+手动等价步骤：
 
 ```bash
-pip install -r requirements.txt
+python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.1,<2.5"
+python -m pip install -r requirements-cpu.txt
 unzip -o dataset/NYC.zip -d dataset/
 ```
 
-Always run from the **repo root**.
+### 2b. GPU（本机 CUDA）
+
+先到 [pytorch.org](https://pytorch.org/get-started/locally/) 选和本机 CUDA 匹配的 index。例如 CUDA 12.1：
+
+```bash
+python -m pip install --index-url https://download.pytorch.org/whl/cu121 "torch>=2.1,<2.5"
+python -m pip install -r requirements.txt
+unzip -o dataset/NYC.zip -d dataset/
+```
+
+其它常见 index：`cu118`（CUDA 11.8）、`cu124`（CUDA 12.4）。不要用默认 PyPI 的 `torch` 来代替上面的 index（CPU 机器会下到巨大的 CUDA 包）。
+
+### 3. 确认装好了
+
+```bash
+python - <<'PY'
+import sys, torch, numpy, pandas, sklearn, yaml, tqdm, networkx, scipy
+print("python", sys.version.split()[0])
+print("torch ", torch.__version__, "cuda", torch.cuda.is_available())
+print("numpy ", numpy.__version__, "pandas", pandas.__version__)
+PY
+```
+
+CPU 上 `cuda` 应为 `False`；GPU 上应为 `True`。新开一个 shell 时先 `source .venv/bin/activate`。
+
+### 4. 数据文件
+
+解压后至少要有：
+
+- `dataset/NYC/NYC_train.csv`
+- `dataset/NYC/NYC_val.csv`
+- `dataset/NYC/NYC_test.csv`
+- `dataset/NYC/graph_X.csv`（POI 表：坐标 / 类别；因果训练**不用** `graph_A.csv`）
+
+### 5. 跑通一次（可选）
+
+```bash
+bash causal/run_cpu_smoke.sh
+```
+
+成功后会在 `runs/causal/<name>/predictions/metrics.json` 写出指标。
 
 ---
 

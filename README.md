@@ -17,7 +17,12 @@ bash scripts/train_cpu_smoke.sh
 **GPU (local machine with CUDA):**
 
 ```bash
-pip install -r requirements.txt
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+# Example CUDA 12.1; pick cu118/cu121/cu124 at https://pytorch.org/get-started/locally/
+python -m pip install --index-url https://download.pytorch.org/whl/cu121 "torch>=2.1,<2.5"
+python -m pip install -r requirements.txt
 unzip -o dataset/NYC.zip -d dataset/
 python train.py --batch 16 --epochs 200 --name nyc-gpu --exist-ok
 python predict.py \
@@ -29,11 +34,9 @@ python predict.py \
 
 ## Installation
 
-### GPU
+**Python:** 3.10, 3.11, or 3.12 (3.12 verified). Do not use 3.9- or 3.13+.
 
-```bash
-pip install -r requirements.txt
-```
+`torch` is **not** listed in `requirements.txt` because CPU and CUDA wheels come from different indexes. Install torch first, then the requirements file.
 
 ### CPU-only
 
@@ -47,7 +50,20 @@ Or manually:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements-cpu.txt
+python -m pip install --upgrade pip
+python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.1,<2.5"
+python -m pip install -r requirements-cpu.txt
+```
+
+### GPU (CUDA)
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+# Example: CUDA 12.1. Change cu121 to match your driver.
+python -m pip install --index-url https://download.pytorch.org/whl/cu121 "torch>=2.1,<2.5"
+python -m pip install -r requirements.txt
 ```
 
 Always activate the venv in a new shell:
@@ -56,9 +72,15 @@ Always activate the venv in a new shell:
 source .venv/bin/activate
 ```
 
+Check the install:
+
+```bash
+python -c "import torch, numpy, pandas; print(torch.__version__, torch.cuda.is_available())"
+```
+
 ## Requirements
 
-See `requirements.txt` (GPU) or `requirements-cpu.txt` (CPU). Key packages: PyTorch, NumPy, pandas, scikit-learn, PyYAML, tqdm.
+See `requirements.txt` (shared packages) and `requirements-cpu.txt` (includes the former). Key packages: NumPy, pandas, scikit-learn, SciPy, PyYAML, tqdm, networkx. Install PyTorch separately as above.
 
 ## Prepare data
 
