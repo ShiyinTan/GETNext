@@ -85,9 +85,46 @@ python -c "import torch, numpy, pandas; print(torch.__version__, torch.cuda.is_a
 # GPU venv:  2.4.1+cu121 True
 ```
 
+Pick **either** venv or conda, not both in the same shell.
+
+### Conda
+
+Same Python range (3.10–3.12). CPU and GPU are **two env names**, same rule as venv: do not install both torch builds into one env.
+
+**CPU:**
+
+```bash
+conda env create -f environment-cpu.yml
+conda activate getnext-cpu
+unzip -o dataset/NYC.zip -d dataset/
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"  # expect False
+```
+
+Or: `bash scripts/setup_conda_cpu.sh` then `conda activate getnext-cpu`.
+
+**GPU (CUDA 12.1):**
+
+```bash
+conda env create -f environment-gpu.yml
+conda activate getnext-gpu
+unzip -o dataset/NYC.zip -d dataset/
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"  # expect True
+```
+
+For CUDA 11.8, edit `pytorch-cuda=12.1` in `environment-gpu.yml` to `11.8`. `mamba` / `micromamba` work with the same `-f` files.
+
+Need both on one machine:
+
+```bash
+conda activate getnext-cpu    # CPU
+conda activate getnext-gpu    # GPU
+```
+
 ## Requirements
 
 See `requirements.txt` (shared packages) and `requirements-cpu.txt` (includes the former). Key packages: NumPy, pandas, scikit-learn, SciPy, PyYAML, tqdm, networkx. Install PyTorch separately as above.
+
+Conda users: `environment-cpu.yml` / `environment-gpu.yml` (same packages; do not mix with `.venv`).
 
 ## Prepare data
 

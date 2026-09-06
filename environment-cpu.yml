@@ -1,0 +1,23 @@
+# Conda env for GETNext + causal next-POI (CPU).
+# Python 3.12 (3.10 / 3.11 also work). Do not share with the GPU env.
+#
+#   conda env create -f environment-cpu.yml
+#   conda activate getnext-cpu
+#
+# Same packages as requirements.txt, plus CPU torch from the pytorch channel.
+name: getnext-cpu
+channels:
+  - pytorch
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12
+  - pytorch::pytorch>=2.1,<2.5
+  - pytorch::cpuonly
+  - numpy>=1.24,<2.1
+  - pandas>=1.5,<2.3
+  - scipy>=1.10,<1.14
+  - scikit-learn>=1.2,<1.6
+  - pyyaml>=6.0.1
+  - tqdm>=4.65
+  - networkx>=3.0
