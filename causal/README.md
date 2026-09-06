@@ -368,7 +368,7 @@ GPU: drop `--no-cuda`.
 
 Outputs (when `--output-dir` is omitted, written next to the run):
 
-- `predictions/metrics.json` — overall + distance / pop / area slices for **each** mode
+- `predictions/metrics.json` — 顶层 `top1_acc` / `HR1` / `H5` / `H10` / `NDCG5` / `NDCG10` / `mAP20` / `mrr` 与 GETNext 相同（factual）；另含各 mode 的 overall + distance / pop / area slices
 - `predictions/predictions.jsonl` — per-trajectory top-k (factual and `deconf_pref`)
 
 Do not pick checkpoints with deconfounded Acc (spec §7). Training monitors **factual** Acc@1 / Acc@20.
@@ -401,12 +401,12 @@ Do not pick checkpoints with deconfounded Acc (spec §7). Training monitors **fa
 runs/causal/<name>/
   ├── args.yaml
   ├── log_training.txt
-  ├── metrics-train.txt
-  ├── metrics-val.txt          # factual and deconf_pref Acc@k
+  ├── metrics-train.txt        # GETNext 同款字段 + HR/H/NDCG + pref/conf/adv/recon
+  ├── metrics-val.txt          # GETNext 同款 factual 字段 + HR/H/NDCG + deconf
   ├── poi_table_meta.pkl
   ├── checkpoints/best_epoch.state.pt
   └── predictions/
-        ├── metrics.json
+        ├── metrics.json       # 顶层 top1_acc / HR1 / H5 / H10 / NDCG5 / NDCG10 / mAP20 / mrr
         └── predictions.jsonl
 ```
 

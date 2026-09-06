@@ -25,10 +25,11 @@ from model import (
     UserEmbeddings,
 )
 from utils import (
-    MRR_metric_last_timestep,
+    RANKING_METRIC_KEYS,
     calculate_laplacian_matrix,
-    mAP_metric_last_timestep,
-    top_k_acc_last_timestep,
+    last_timestep_metric_dict,
+    mean_or_nan,
+    to_predict_metrics,
 )
 
 
@@ -219,15 +220,8 @@ def main():
         return y_pred_poi_adjusted
 
     criterion_poi = nn.CrossEntropyLoss(ignore_index=-1)
-    metrics = {
-        "top1": [],
-        "top5": [],
-        "top10": [],
-        "top20": [],
-        "mAP20": [],
-        "mrr": [],
-        "poi_loss": [],
-    }
+    metrics = {k: [] for k in RANKING_METRIC_KEYS}
+    metrics["poi_loss"] = []
     predictions = []
 
     with torch.no_grad():
@@ -266,12 +260,9 @@ def main():
             ):
                 label_pois = label_pois[:seq_len]
                 pred_pois = pred_pois[:seq_len, :]
-                metrics["top1"].append(top_k_acc_last_timestep(label_pois, pred_pois, k=1))
-                metrics["top5"].append(top_k_acc_last_timestep(label_pois, pred_pois, k=5))
-                metrics["top10"].append(top_k_acc_last_timestep(label_pois, pred_pois, k=10))
-                metrics["top20"].append(top_k_acc_last_timestep(label_pois, pred_pois, k=20))
-                metrics["mAP20"].append(mAP_metric_last_timestep(label_pois, pred_pois, k=20))
-                metrics["mrr"].append(MRR_metric_last_timestep(label_pois, pred_pois))
+                step_m = last_timestep_metric_dict(label_pois, pred_pois)
+                for key, value in step_m.items():
+                    metrics[key].append(value)
 
                 last_label = int(label_pois[-1])
                 last_pred = pred_pois[-1]
@@ -287,19 +278,17 @@ def main():
                     }
                 )
 
+    ranking = to_predict_metrics(
+        {k: mean_or_nan(metrics[k]) for k in RANKING_METRIC_KEYS}
+    )
     summary = {
         "num_trajectories": len(dataset),
         "checkpoint": cli.checkpoint,
         "data_test": cli.data_test,
         "device": str(device),
         "epoch": ckpt.get("epoch"),
-        "poi_loss": float(np.mean(metrics["poi_loss"])) if metrics["poi_loss"] else None,
-        "top1_acc": float(np.mean(metrics["top1"])) if metrics["top1"] else None,
-        "top5_acc": float(np.mean(metrics["top5"])) if metrics["top5"] else None,
-        "top10_acc": float(np.mean(metrics["top10"])) if metrics["top10"] else None,
-        "top20_acc": float(np.mean(metrics["top20"])) if metrics["top20"] else None,
-        "mAP20": float(np.mean(metrics["mAP20"])) if metrics["mAP20"] else None,
-        "mrr": float(np.mean(metrics["mrr"])) if metrics["mrr"] else None,
+        "poi_loss": mean_or_nan(metrics["poi_loss"]) if metrics["poi_loss"] else None,
+        **ranking,
     }
 
     out_dir = cli.output_dir or str(Path(cli.checkpoint).resolve().parents[1] / "predictions")

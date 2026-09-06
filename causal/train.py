@@ -2,7 +2,7 @@
 
 整体流程和 GETNext 几乎一样，方便对照：
   读轨迹 CSV → 按轨迹做成样本 → 补齐成 batch → 前向算分 → 算损失 → 反向更新
-  → 每个 epoch 在验证集上看 Acc@k / MRR → 存最好的 checkpoint
+  → 每个 epoch 在验证集上看 Acc@k / mAP@20 / MRR → 存最好的 checkpoint
 
 和 GETNext 不同、按因果规格改掉的部分：
   - 不用 GCN、不用 NodeAttnMap
@@ -66,10 +66,19 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from causal.features import build_poi_table, fill_transition_priors, load_nodes_df
-from causal.metrics import SliceMeter, basic_metrics
+from causal.metrics import batch_last_step_metrics
 from causal.model import CausalNextPOI
 from causal.param_parser import parameter_parser
-from utils import increment_path, zipdir
+from utils import (
+    RANKING_METRIC_KEYS,
+    epoch_ckpt_metrics,
+    format_epoch_summary,
+    format_ranking_lines,
+    increment_path,
+    mean_or_nan,
+    write_epoch_metrics_txt,
+    zipdir,
+)
 
 SEP = '-' * 72
 
@@ -388,67 +397,11 @@ def compute_losses(model, batch, buffers, args, ce):
     return parts
 
 
-@torch.no_grad()
-def eval_batch_metrics(parts, batch, buffers, meter_fact, meter_deconf):
-    """验证：factual 用总分 s，deconf 用兴趣分 s_pref；只评每条轨迹最后一步。
-
-    输入:
-        parts: compute_losses 的输出
-            s / s_pref: (B, T, N)
-            c_acc / c_pop: (B, T)
-        batch: collate dict，y_poi (B,T)，poi (B,T)，lengths list[B]
-        buffers['area_id']: (N,)
-        meter_fact / meter_deconf: SliceMeter
-    输出:
-        无返回。每条轨迹往两个 meter 各 add 一次。
-    """
+def _batch_rank_metrics(parts, batch, score_key):
+    """和 GETNext 一样：一个 batch 里每条轨迹只评最后一步，再对 batch 取平均。"""
     y_np = batch['y_poi'].detach().cpu().numpy()
-    s_np = parts['s'].detach().cpu().numpy()
-    pref_np = parts['s_pref'].detach().cpu().numpy()
-    area = buffers['area_id'].detach().cpu().numpy()
-    c_acc = parts['c_acc'].detach().cpu().numpy()
-    c_pop = parts['c_pop'].detach().cpu().numpy()
-    poi = batch['poi'].detach().cpu().numpy()
-    for i, L in enumerate(batch['lengths']):
-        y_i, s_i = y_np[i, :L], s_np[i, :L]
-        p_i = pref_np[i, :L]
-        origin = int(poi[i, L - 1])
-        dest = int(y_i[-1])
-        same = bool(area[origin] == area[dest])
-        meter_fact.add(y_i, s_i, c_acc[i, L - 1], c_pop[i, L - 1], same)
-        meter_deconf.add(y_i, p_i, c_acc[i, L - 1], c_pop[i, L - 1], same)
-
-
-def format_epoch_summary(epoch, total, lr, train_loss, fact, deconf, saved=False, score=None):
-    """每个 epoch 打在屏幕上的一小段摘要。
-
-    输入:
-        epoch / total: int
-        lr: float
-        train_loss / fact / deconf: dict，含 top1 等标量
-        saved: bool
-        score: float 或 None
-    输出:
-        str，多行文本
-    """
-    lines = [
-        SEP,
-        f' Epoch {epoch + 1:>4d}/{total}  |  lr={lr:.2e}',
-        SEP,
-        (f' Train  loss {train_loss["loss"]:>8.4f}  main {train_loss["main"]:>7.4f}  '
-         f'pref {train_loss["pref"]:>7.4f}  conf {train_loss["conf"]:>7.4f}'),
-        (f'        Acc@1 {train_loss["top1"]:.4f}  Acc@5 {train_loss["top5"]:.4f}  '
-         f'Acc@10 {train_loss["top10"]:.4f}  Acc@20 {train_loss["top20"]:.4f}  '
-         f'MRR {train_loss["mrr"]:.4f}'),
-        (f' Val    factual   Acc@1 {fact["top1"]:.4f}  Acc@5 {fact["top5"]:.4f}  '
-         f'Acc@10 {fact["top10"]:.4f}  Acc@20 {fact["top20"]:.4f}  MRR {fact["mrr"]:.4f}'),
-        (f'        deconf    Acc@1 {deconf["top1"]:.4f}  Acc@5 {deconf["top5"]:.4f}  '
-         f'Acc@10 {deconf["top10"]:.4f}  Acc@20 {deconf["top20"]:.4f}  MRR {deconf["mrr"]:.4f}'),
-    ]
-    if saved:
-        lines.append(f' * Saved best checkpoint  (score={score:.4f})')
-    lines.append(SEP)
-    return '\n'.join(lines)
+    s_np = parts[score_key].detach().cpu().numpy()
+    return batch_last_step_metrics(y_np, s_np, batch['lengths'])
 
 
 def train(args):
@@ -574,11 +527,12 @@ def train(args):
     logging.info('[4/4] Start training...')
     max_val_score = -np.inf
     train_hist, val_hist = [], []
+    rank_keys = RANKING_METRIC_KEYS
+    train_loss_keys = ('loss', 'poi', 'time', 'cat', 'pref', 'conf', 'adv', 'recon')
 
     for epoch in range(args.epochs):
         model.train()
-        tr_parts = {k: [] for k in ('loss', 'main', 'pref', 'conf', 'adv', 'recon', 'top1', 'top5', 'top10', 'top20', 'mrr')}
-        n_train = 0
+        tr_parts = {k: [] for k in train_loss_keys + rank_keys}
         pbar = tqdm(train_loader, desc=f'Epoch {epoch + 1}/{args.epochs} train',
                     leave=False, dynamic_ncols=True)
         for b_idx, batch in enumerate(pbar):
@@ -590,30 +544,25 @@ def train(args):
             parts['loss'].backward()
             optimizer.step()
 
-            y_np = batch['y_poi'].detach().cpu().numpy()
-            s_np = parts['s'].detach().cpu().numpy()
-            batch_m = []
-            for i, L in enumerate(batch['lengths']):
-                batch_m.append(basic_metrics(y_np[i, :L], s_np[i, :L]))
+            batch_m = _batch_rank_metrics(parts, batch, 's')
             tr_parts['loss'].append(float(parts['loss'].detach().cpu()))
-            tr_parts['main'].append(float(parts['main'].detach().cpu()))
+            tr_parts['poi'].append(float(parts['main'].detach().cpu()))
+            tr_parts['time'].append(float(parts['time'].detach().cpu()))
+            tr_parts['cat'].append(float(parts['cat'].detach().cpu()))
             tr_parts['pref'].append(float(parts['pref'].detach().cpu()))
             tr_parts['conf'].append(float(parts['conf'].detach().cpu()))
             tr_parts['adv'].append(float(parts['adv'].detach().cpu()))
             tr_parts['recon'].append(float(parts['recon'].detach().cpu()))
-            tr_parts['top1'].append(np.mean([m['top1'] for m in batch_m]))
-            tr_parts['top5'].append(np.mean([m['top5'] for m in batch_m]))
-            tr_parts['top10'].append(np.mean([m['top10'] for m in batch_m]))
-            tr_parts['top20'].append(np.mean([m['top20'] for m in batch_m]))
-            tr_parts['mrr'].append(np.mean([m['mrr'] for m in batch_m]))
-            n_train += 1
+            for k in rank_keys:
+                tr_parts[k].append(batch_m[k])
             pbar.set_postfix(loss=f'{tr_parts["loss"][-1]:.2f}',
+                             avg=f'{float(np.mean(tr_parts["loss"])):.2f}',
                              top1=f'{tr_parts["top1"][-1]:.3f}', refresh=False)
 
-        # 验证：不算梯度；同时累计 factual / deconf 两套 last-step 指标
+        # 验证：不算梯度；factual 用总分 s，deconf 用兴趣分 s_pref；聚合方式和 GETNext 相同
         model.eval()
-        meter_f, meter_d = SliceMeter(), SliceMeter()
-        val_losses = []
+        val_parts = {k: [] for k in ('loss', 'poi', 'time', 'cat') + rank_keys}
+        deconf_parts = {k: [] for k in rank_keys}
         with torch.no_grad():
             vbar = tqdm(val_loader, desc=f'Epoch {epoch + 1}/{args.epochs} val  ',
                         leave=False, dynamic_ncols=True)
@@ -622,19 +571,29 @@ def train(args):
                     break
                 batch = _to_device(batch, args.device)
                 parts = compute_losses(model, batch, buffers, args, ce)
-                val_losses.append(float(parts['loss'].detach().cpu()))
-                eval_batch_metrics(parts, batch, buffers, meter_f, meter_d)
-                vbar.set_postfix(loss=f'{val_losses[-1]:.2f}', refresh=False)
+                fact_m = _batch_rank_metrics(parts, batch, 's')
+                deconf_m = _batch_rank_metrics(parts, batch, 's_pref')
+                val_parts['loss'].append(float(parts['loss'].detach().cpu()))
+                val_parts['poi'].append(float(parts['main'].detach().cpu()))
+                val_parts['time'].append(float(parts['time'].detach().cpu()))
+                val_parts['cat'].append(float(parts['cat'].detach().cpu()))
+                for k in rank_keys:
+                    val_parts[k].append(fact_m[k])
+                    deconf_parts[k].append(deconf_m[k])
+                vbar.set_postfix(
+                    loss=f'{val_parts["loss"][-1]:.2f}',
+                    avg=f'{float(np.mean(val_parts["loss"])):.2f}',
+                    top1=f'{val_parts["top1"][-1]:.3f}',
+                    refresh=False)
 
-        fact = meter_f.summary()['overall']
-        deconf = meter_d.summary()['overall']
-        train_m = {k: float(np.mean(v)) for k, v in tr_parts.items()}
-        val_loss = float(np.mean(val_losses)) if val_losses else np.inf
-        scheduler.step(val_loss)
+        train_m = {k: mean_or_nan(v) for k, v in tr_parts.items()}
+        val_m = {k: mean_or_nan(v) for k, v in val_parts.items()}
+        deconf = {k: mean_or_nan(v) for k, v in deconf_parts.items()}
+        scheduler.step(val_m['loss'])
         # 和 GETNext 一样用 factual Acc@1/Acc@20 组合分挑最好的模型
-        monitor_score = float(fact['top1'] * 4 + fact['top20']) if fact['top1'] is not None else -np.inf
+        monitor_score = float(val_m['top1'] * 4 + val_m['top20']) if np.isfinite(val_m['top1']) else -np.inf
         saved = False
-        if args.save_weights and fact['top1'] is not None and monitor_score >= max_val_score:
+        if args.save_weights and np.isfinite(val_m['top1']) and monitor_score >= max_val_score:
             ckpt_dir = os.path.join(args.save_dir, 'checkpoints')
             os.makedirs(ckpt_dir, exist_ok=True)
             state = {
@@ -648,20 +607,37 @@ def train(args):
                 'poi_idx2cat_idx_dict': poi_idx2cat_idx,
                 'median_acc_bin': table.median_acc_bin,
                 'median_pop_bin': table.median_pop_bin,
-                'epoch_val_factual': fact,
-                'epoch_val_deconf': deconf,
+                'epoch_train_metrics': epoch_ckpt_metrics('train', train_m),
+                'epoch_val_metrics': epoch_ckpt_metrics('val', val_m),
+                'epoch_val_deconf': {
+                    'epoch_val_deconf_top1_acc': deconf['top1'],
+                    'epoch_val_deconf_top5_acc': deconf['top5'],
+                    'epoch_val_deconf_top10_acc': deconf['top10'],
+                    'epoch_val_deconf_top20_acc': deconf['top20'],
+                    'epoch_val_deconf_HR1': deconf['hr1'],
+                    'epoch_val_deconf_H5': deconf['h5'],
+                    'epoch_val_deconf_H10': deconf['h10'],
+                    'epoch_val_deconf_NDCG5': deconf['ndcg5'],
+                    'epoch_val_deconf_NDCG10': deconf['ndcg10'],
+                    'epoch_val_deconf_mAP20': deconf['map20'],
+                    'epoch_val_deconf_mrr': deconf['mrr'],
+                },
             }
             torch.save(state, os.path.join(ckpt_dir, 'best_epoch.state.pt'))
             with open(os.path.join(ckpt_dir, 'best_epoch.txt'), 'w') as f:
-                print({'factual': fact, 'deconf_pref': deconf, 'val_loss': val_loss}, file=f)
+                print({**state['epoch_val_metrics'], **state['epoch_val_deconf']}, file=f)
             max_val_score = monitor_score
             saved = True
 
+        extra_lines = format_ranking_lines(deconf, indent=' Deconf ')
         logging.info(format_epoch_summary(
-            epoch, args.epochs, optimizer.param_groups[0]['lr'], train_m, fact, deconf,
-            saved=saved, score=max_val_score if saved else None))
+            epoch, args.epochs, optimizer.param_groups[0]['lr'], train_m, val_m,
+            saved_best=saved, best_score=max_val_score if saved else None,
+            extra_lines=extra_lines, sep=SEP))
         train_hist.append(train_m)
-        val_hist.append({'loss': val_loss, 'factual': fact, 'deconf_pref': deconf})
+        val_row = dict(val_m)
+        val_row.update({f'deconf_{k}': deconf[k] for k in rank_keys})
+        val_hist.append(val_row)
         _write_hist(args.save_dir, train_hist, val_hist)
 
     logging.info(f'Training finished. Best val score={max_val_score:.4f}')
@@ -687,38 +663,37 @@ def _to_device(batch, device):
 
 
 def _write_hist(save_dir, train_hist, val_hist):
-    """每个 epoch 覆盖写入 metrics-train.txt / metrics-val.txt，方便画曲线。
+    """每个 epoch 覆盖写入 metrics-train.txt / metrics-val.txt，字段名和 GETNext 对齐。
 
     输入:
         save_dir: str
-        train_hist: list[dict]，每个 epoch 的训练标量
-        val_hist: list[dict]，含 loss / factual / deconf_pref
+        train_hist / val_hist: list[dict]
     输出:
         无返回。写两个文本文件。
     """
-    def _dump(path, rows, prefix):
-        """
-        输入:
-            path: str
-            rows: list[dict]
-            prefix: str
-        输出: 无返回，写文本行 prefix_key_list=[...]
-        """
-        with open(path, 'w') as f:
-            if not rows:
-                return
-            for key in rows[0].keys():
-                if key in ('factual', 'deconf_pref'):
-                    continue
-                vals = [float(f'{r[key]:.4f}') for r in rows]
-                print(f'{prefix}_{key}_list={vals}', file=f)
-    _dump(os.path.join(save_dir, 'metrics-train.txt'), train_hist, 'train')
-    with open(os.path.join(save_dir, 'metrics-val.txt'), 'w') as f:
-        print(f'val_loss_list={[float(f"{r["loss"]:.4f}") for r in val_hist]}', file=f)
-        for split in ('factual', 'deconf_pref'):
-            for key in ('top1', 'top5', 'top10', 'top20', 'mrr'):
-                vals = [float(f'{r[split][key]:.4f}') for r in val_hist]
-                print(f'val_{split}_{key}_list={vals}', file=f)
+    write_epoch_metrics_txt(
+        os.path.join(save_dir, 'metrics-train.txt'), 'train', train_hist,
+        extra_keys=[
+            ('train_epochs_pref_loss_list', 'pref'),
+            ('train_epochs_conf_loss_list', 'conf'),
+            ('train_epochs_adv_loss_list', 'adv'),
+            ('train_epochs_recon_loss_list', 'recon'),
+        ])
+    write_epoch_metrics_txt(
+        os.path.join(save_dir, 'metrics-val.txt'), 'val', val_hist,
+        extra_keys=[
+            ('val_epochs_deconf_top1_acc_list', 'deconf_top1'),
+            ('val_epochs_deconf_top5_acc_list', 'deconf_top5'),
+            ('val_epochs_deconf_top10_acc_list', 'deconf_top10'),
+            ('val_epochs_deconf_top20_acc_list', 'deconf_top20'),
+            ('val_epochs_deconf_hr1_list', 'deconf_hr1'),
+            ('val_epochs_deconf_h5_list', 'deconf_h5'),
+            ('val_epochs_deconf_h10_list', 'deconf_h10'),
+            ('val_epochs_deconf_ndcg5_list', 'deconf_ndcg5'),
+            ('val_epochs_deconf_ndcg10_list', 'deconf_ndcg10'),
+            ('val_epochs_deconf_mAP20_list', 'deconf_map20'),
+            ('val_epochs_deconf_mrr_list', 'deconf_mrr'),
+        ])
 
 
 if __name__ == '__main__':
