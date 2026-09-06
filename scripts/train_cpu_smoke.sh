@@ -19,11 +19,15 @@ fi
 EPOCHS="${EPOCHS:-3}"
 BATCH="${BATCH:-8}"
 NAME="${NAME:-cpu-smoke}"
+MAX_BATCHES="${MAX_BATCHES:-0}"
+MAX_VAL_BATCHES="${MAX_VAL_BATCHES:-0}"
+MAX_TEST_BATCHES="${MAX_TEST_BATCHES:-0}"
 
 echo "=== GETNext CPU smoke train (${EPOCHS} epochs, batch=${BATCH}) ==="
 python train.py \
   --data-train dataset/NYC/NYC_train.csv \
   --data-val dataset/NYC/NYC_val.csv \
+  --data-test dataset/NYC/NYC_test.csv \
   --data-adj-mtx dataset/NYC/graph_A.csv \
   --data-node-feats dataset/NYC/graph_X.csv \
   --time-units 48 \
@@ -40,6 +44,9 @@ python train.py \
   --epochs "${EPOCHS}" \
   --workers 0 \
   --no-cuda \
+  --max-batches "${MAX_BATCHES}" \
+  --max-val-batches "${MAX_VAL_BATCHES}" \
+  --max-test-batches "${MAX_TEST_BATCHES}" \
   --name "${NAME}" \
   --exist-ok
 
@@ -60,5 +67,5 @@ python predict.py \
   --no-cuda \
   --output-dir "${RUN_DIR}/predictions"
 
-echo "Done. Metrics: ${RUN_DIR}/metrics-val.txt"
+echo "Done. Metrics: ${RUN_DIR}/metrics-val.txt ${RUN_DIR}/metrics-test.txt"
 echo "Predictions: ${RUN_DIR}/predictions/"

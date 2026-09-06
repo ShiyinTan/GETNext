@@ -36,6 +36,31 @@ def parameter_parser():
                         type=str,
                         default='dataset/NYC/NYC_val.csv',
                         help='Validation data path')
+    parser.add_argument('--data-test',
+                        type=str,
+                        default='dataset/NYC/NYC_test.csv',
+                        help='Test data path (evaluated each epoch after val)')
+    parser.add_argument('--eval-test',
+                        dest='eval_test',
+                        action='store_true',
+                        default=True,
+                        help='Run the test split after every val (default on)')
+    parser.add_argument('--no-eval-test',
+                        dest='eval_test',
+                        action='store_false',
+                        help='Skip in-training test eval')
+    parser.add_argument('--max-val-batches',
+                        type=int,
+                        default=0,
+                        help='Cap val batches per epoch; 0 = all')
+    parser.add_argument('--max-test-batches',
+                        type=int,
+                        default=0,
+                        help='Cap test batches per epoch; 0 = all')
+    parser.add_argument('--max-batches',
+                        type=int,
+                        default=0,
+                        help='Cap train batches per epoch; 0 = all (smoke)')
     parser.add_argument('--short-traj-thres',
                         type=int,
                         default=2,

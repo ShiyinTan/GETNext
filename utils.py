@@ -291,22 +291,35 @@ def format_ranking_lines(m, indent='        '):
     ]
 
 
+def _split_loss_line(name, m):
+    """One console line: split name + loss / poi / time / cat."""
+    return (f' {name:<6} loss {m["loss"]:>8.4f}  '
+            f'poi {m["poi"]:>7.4f}  time {m["time"]:>7.4f}  cat {m["cat"]:>7.4f}')
+
+
 def format_epoch_summary(epoch, total_epochs, lr, train_m, val_m, saved_best=False,
-                         best_score=None, extra_lines=None, sep='-' * 72):
-    """Compact, aligned epoch metrics block for the console (GETNext layout)."""
+                         best_score=None, extra_lines=None, sep='-' * 72,
+                         test_m=None, test_extra_lines=None):
+    """Compact, aligned epoch metrics block for the console (GETNext layout).
+
+    Val is used for checkpoint selection. Optional test_m is monitoring only.
+    """
     lines = [
         sep,
         f' Epoch {epoch + 1:>4d}/{total_epochs}  |  lr={lr:.2e}',
         sep,
-        (f' Train  loss {train_m["loss"]:>8.4f}  '
-         f'poi {train_m["poi"]:>7.4f}  time {train_m["time"]:>7.4f}  cat {train_m["cat"]:>7.4f}'),
+        _split_loss_line('Train', train_m),
         *format_ranking_lines(train_m),
-        (f' Val    loss {val_m["loss"]:>8.4f}  '
-         f'poi {val_m["poi"]:>7.4f}  time {val_m["time"]:>7.4f}  cat {val_m["cat"]:>7.4f}'),
+        _split_loss_line('Val', val_m),
         *format_ranking_lines(val_m),
     ]
+    if test_m is not None:
+        lines.append(_split_loss_line('Test', test_m))
+        lines.extend(format_ranking_lines(test_m))
     if extra_lines:
         lines.extend(extra_lines)
+    if test_extra_lines:
+        lines.extend(test_extra_lines)
     if saved_best:
         lines.append(f' * Saved best checkpoint  (score={best_score:.4f})')
     lines.append(sep)
@@ -336,7 +349,7 @@ def epoch_ckpt_metrics(split, m):
 
 
 def write_epoch_metrics_txt(path, split, rows, extra_keys=None):
-    """Write GETNext `metrics-train.txt` / `metrics-val.txt` lists.
+    """Write GETNext `metrics-train.txt` / `metrics-val.txt` / `metrics-test.txt` lists.
 
     rows: list of dicts with keys loss, poi, time, cat, top1..top20, map20, mrr,
     plus ndcg5/ndcg10 (HR@1 / H@5 / H@10 are filled from Acc@k if missing).
