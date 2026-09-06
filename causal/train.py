@@ -2,7 +2,7 @@
 
 整体流程和 GETNext 几乎一样，方便对照：
   读轨迹 CSV → 按轨迹做成样本 → 补齐成 batch → 前向算分 → 算损失 → 反向更新
-  → 每个 epoch 在验证集上看 Acc@k / mAP@20 / MRR → 存最好的 checkpoint
+  → 每个 epoch 在验证集上看 Acc@k / mAP@20 / MRR，并立刻在测试集上再评一次（方便看能力；选 checkpoint 仍只用 val） → 存最好的 checkpoint
 
 和 GETNext 不同、按因果规格改掉的部分：
   - 不用 GCN、不用 NodeAttnMap
@@ -18,9 +18,10 @@ collate 之后一个 batch 的关键 tensor：
 
 读进来的表长什么样（NYC，和 GETNext 同一套 CSV）
 ----------------------------------------------
-train_df / val_df = 签到明细，一行一次 check-in，不是一条轨迹一行。
+train_df / val_df / test_df = 签到明细，一行一次 check-in，不是一条轨迹一行。
   文件: dataset/NYC/NYC_train.csv （约 8.3 万行 / 1.1 万条轨迹 / 1047 用户）
         dataset/NYC/NYC_val.csv
+        dataset/NYC/NYC_test.csv  （每个 epoch 的 val 之后评一次；不参与选模型）
   本文件真正用到的列：
     user_id            整数，如 470
     POI_id             Foursquare 字符串 id，如 '49bbd6c0f964a520f4531fe3'
@@ -404,6 +405,41 @@ def _batch_rank_metrics(parts, batch, score_key):
     return batch_last_step_metrics(y_np, s_np, batch['lengths'])
 
 
+def _eval_split(model, loader, buffers, args, ce, max_batches, desc):
+    """无梯度跑一个 split：factual（总分 s）+ deconf（兴趣分 s_pref）。
+
+    聚合方式和 GETNext 相同：每个 batch 先对轨迹取 last-step 均值，再对 batch 取均值。
+    """
+    rank_keys = RANKING_METRIC_KEYS
+    parts_acc = {k: [] for k in ('loss', 'poi', 'time', 'cat') + rank_keys}
+    deconf_acc = {k: [] for k in rank_keys}
+    with torch.no_grad():
+        bar = tqdm(loader, desc=desc, leave=False, dynamic_ncols=True)
+        for b_idx, batch in enumerate(bar):
+            if max_batches and b_idx >= max_batches:
+                break
+            batch = _to_device(batch, args.device)
+            parts = compute_losses(model, batch, buffers, args, ce)
+            fact_m = _batch_rank_metrics(parts, batch, 's')
+            deconf_m = _batch_rank_metrics(parts, batch, 's_pref')
+            parts_acc['loss'].append(float(parts['loss'].detach().cpu()))
+            parts_acc['poi'].append(float(parts['main'].detach().cpu()))
+            parts_acc['time'].append(float(parts['time'].detach().cpu()))
+            parts_acc['cat'].append(float(parts['cat'].detach().cpu()))
+            for k in rank_keys:
+                parts_acc[k].append(fact_m[k])
+                deconf_acc[k].append(deconf_m[k])
+            bar.set_postfix(
+                loss=f'{parts_acc["loss"][-1]:.2f}',
+                avg=f'{float(np.mean(parts_acc["loss"])):.2f}',
+                top1=f'{parts_acc["top1"][-1]:.3f}',
+                refresh=False)
+    return (
+        {k: mean_or_nan(v) for k, v in parts_acc.items()},
+        {k: mean_or_nan(v) for k, v in deconf_acc.items()},
+    )
+
+
 def train(args):
     """完整训练循环：读数据 → 建表 → epoch 更新 → 按 factual Acc 存 checkpoint。
 
@@ -413,7 +449,7 @@ def train(args):
         无返回。写到 args.save_dir：
           checkpoints/best_epoch.state.pt
           poi_table_meta.pkl
-          metrics-train.txt / metrics-val.txt
+          metrics-train.txt / metrics-val.txt / metrics-test.txt
     """
     # ---------- 0. 目录、日志、把本次参数存下来 ----------
     args.device = resolve_device(args)
@@ -429,6 +465,10 @@ def train(args):
                  f'adv={args.lambda_adv} recon={args.lambda_recon}')
     logging.info(f' score w  : pref={args.w_pref} conf={args.w_conf} '
                  f'acc={args.w_acc} pop={args.w_pop} area={args.w_area} ctx={args.w_ctx}')
+    logging.info(f' train    : {args.data_train}')
+    logging.info(f' val      : {args.data_val}')
+    if args.eval_test:
+        logging.info(f' test     : {args.data_test}  (monitor only; ckpt uses val)')
     logging.info(SEP)
     with open(os.path.join(args.save_dir, 'args.yaml'), 'w') as f:
         yaml.dump({k: (str(v) if k == 'device' else v) for k, v in vars(args).items()},
@@ -442,6 +482,12 @@ def train(args):
     # 签到明细：一行一次 check-in。NYC_train 约 8.3 万行，列见文件头注释。
     train_df = pd.read_csv(args.data_train)
     val_df = pd.read_csv(args.data_val)
+    test_df = None
+    if args.eval_test:
+        if os.path.isfile(args.data_test):
+            test_df = pd.read_csv(args.data_test)
+        else:
+            logging.warning(f'Test CSV not found ({args.data_test}); skipping in-training test eval')
     # 地点表 graph_X.csv：一行一个 POI。NYC 约 4980 行 ×
     #   node_name/poi_id, checkin_cnt, poi_catid, poi_catid_code, poi_catname, latitude, longitude
     nodes_df = load_nodes_df(args.data_node_feats)
@@ -468,6 +514,11 @@ def train(args):
     val_ds = TrajectoryDataset(
         val_df, poi_id2idx, user_id2idx, poi_idx2cat_idx,
         args.time_feature, args.short_traj_thres, skip_unknown_user=True)
+    test_ds = None
+    if test_df is not None:
+        test_ds = TrajectoryDataset(
+            test_df, poi_id2idx, user_id2idx, poi_idx2cat_idx,
+            args.time_feature, args.short_traj_thres, skip_unknown_user=True)
 
     train_pairs = []
     for s in train_ds.samples:
@@ -475,8 +526,9 @@ def train(args):
             train_pairs.append((o, d))  # 都是 0..N-1 的 POI 下标，不是原始字符串 id
     fill_transition_priors(table, train_pairs)
 
+    test_n = len(test_ds) if test_ds is not None else 0
     logging.info(f'        POIs={table.num_pois} cats={len(cat_id2idx)} users={len(user_id2idx)} '
-                 f'train_trajs={len(train_ds)} val_trajs={len(val_ds)} '
+                 f'train_trajs={len(train_ds)} val_trajs={len(val_ds)} test_trajs={test_n} '
                  f'areas={table.num_areas} acc_bins={table.num_acc_bins}')
 
     train_loader = DataLoader(
@@ -485,6 +537,11 @@ def train(args):
     val_loader = DataLoader(
         val_ds, batch_size=args.batch, shuffle=False, drop_last=False,
         num_workers=args.workers, collate_fn=collate_pad)
+    test_loader = None
+    if test_ds is not None and len(test_ds) > 0:
+        test_loader = DataLoader(
+            test_ds, batch_size=args.batch, shuffle=False, drop_last=False,
+            num_workers=args.workers, collate_fn=collate_pad)
 
     # ---------- 3. 搭模型（没有 GCN）----------
     logging.info('[3/4] Building causal model (no GCN / NodeAttnMap)...')
@@ -526,7 +583,7 @@ def train(args):
     # ---------- 4. epoch 循环 ----------
     logging.info('[4/4] Start training...')
     max_val_score = -np.inf
-    train_hist, val_hist = [], []
+    train_hist, val_hist, test_hist = [], [], []
     rank_keys = RANKING_METRIC_KEYS
     train_loss_keys = ('loss', 'poi', 'time', 'cat', 'pref', 'conf', 'adv', 'recon')
 
@@ -559,36 +616,19 @@ def train(args):
                              avg=f'{float(np.mean(tr_parts["loss"])):.2f}',
                              top1=f'{tr_parts["top1"][-1]:.3f}', refresh=False)
 
-        # 验证：不算梯度；factual 用总分 s，deconf 用兴趣分 s_pref；聚合方式和 GETNext 相同
+        # 验证 + 测试：不算梯度；factual 用总分 s，deconf 用兴趣分 s_pref。
+        # checkpoint 仍只看 val factual Acc@1/Acc@20，test 只用于快速看能力。
         model.eval()
-        val_parts = {k: [] for k in ('loss', 'poi', 'time', 'cat') + rank_keys}
-        deconf_parts = {k: [] for k in rank_keys}
-        with torch.no_grad():
-            vbar = tqdm(val_loader, desc=f'Epoch {epoch + 1}/{args.epochs} val  ',
-                        leave=False, dynamic_ncols=True)
-            for vb_idx, batch in enumerate(vbar):
-                if args.max_val_batches and vb_idx >= args.max_val_batches:
-                    break
-                batch = _to_device(batch, args.device)
-                parts = compute_losses(model, batch, buffers, args, ce)
-                fact_m = _batch_rank_metrics(parts, batch, 's')
-                deconf_m = _batch_rank_metrics(parts, batch, 's_pref')
-                val_parts['loss'].append(float(parts['loss'].detach().cpu()))
-                val_parts['poi'].append(float(parts['main'].detach().cpu()))
-                val_parts['time'].append(float(parts['time'].detach().cpu()))
-                val_parts['cat'].append(float(parts['cat'].detach().cpu()))
-                for k in rank_keys:
-                    val_parts[k].append(fact_m[k])
-                    deconf_parts[k].append(deconf_m[k])
-                vbar.set_postfix(
-                    loss=f'{val_parts["loss"][-1]:.2f}',
-                    avg=f'{float(np.mean(val_parts["loss"])):.2f}',
-                    top1=f'{val_parts["top1"][-1]:.3f}',
-                    refresh=False)
+        val_m, deconf = _eval_split(
+            model, val_loader, buffers, args, ce, args.max_val_batches,
+            desc=f'Epoch {epoch + 1}/{args.epochs} val  ')
+        test_m, test_deconf = None, None
+        if test_loader is not None:
+            test_m, test_deconf = _eval_split(
+                model, test_loader, buffers, args, ce, args.max_test_batches,
+                desc=f'Epoch {epoch + 1}/{args.epochs} test ')
 
         train_m = {k: mean_or_nan(v) for k, v in tr_parts.items()}
-        val_m = {k: mean_or_nan(v) for k, v in val_parts.items()}
-        deconf = {k: mean_or_nan(v) for k, v in deconf_parts.items()}
         scheduler.step(val_m['loss'])
         # 和 GETNext 一样用 factual Acc@1/Acc@20 组合分挑最好的模型
         monitor_score = float(val_m['top1'] * 4 + val_m['top20']) if np.isfinite(val_m['top1']) else -np.inf
@@ -609,36 +649,39 @@ def train(args):
                 'median_pop_bin': table.median_pop_bin,
                 'epoch_train_metrics': epoch_ckpt_metrics('train', train_m),
                 'epoch_val_metrics': epoch_ckpt_metrics('val', val_m),
-                'epoch_val_deconf': {
-                    'epoch_val_deconf_top1_acc': deconf['top1'],
-                    'epoch_val_deconf_top5_acc': deconf['top5'],
-                    'epoch_val_deconf_top10_acc': deconf['top10'],
-                    'epoch_val_deconf_top20_acc': deconf['top20'],
-                    'epoch_val_deconf_HR1': deconf['hr1'],
-                    'epoch_val_deconf_H5': deconf['h5'],
-                    'epoch_val_deconf_H10': deconf['h10'],
-                    'epoch_val_deconf_NDCG5': deconf['ndcg5'],
-                    'epoch_val_deconf_NDCG10': deconf['ndcg10'],
-                    'epoch_val_deconf_mAP20': deconf['map20'],
-                    'epoch_val_deconf_mrr': deconf['mrr'],
-                },
+                'epoch_val_deconf': _deconf_ckpt_metrics('val', deconf),
             }
+            if test_m is not None:
+                state['epoch_test_metrics'] = epoch_ckpt_metrics('test', test_m)
+                state['epoch_test_deconf'] = _deconf_ckpt_metrics('test', test_deconf)
             torch.save(state, os.path.join(ckpt_dir, 'best_epoch.state.pt'))
             with open(os.path.join(ckpt_dir, 'best_epoch.txt'), 'w') as f:
-                print({**state['epoch_val_metrics'], **state['epoch_val_deconf']}, file=f)
+                dump = {**state['epoch_val_metrics'], **state['epoch_val_deconf']}
+                if test_m is not None:
+                    dump.update(state['epoch_test_metrics'])
+                    dump.update(state['epoch_test_deconf'])
+                print(dump, file=f)
             max_val_score = monitor_score
             saved = True
 
         extra_lines = format_ranking_lines(deconf, indent=' Deconf ')
+        test_extra = None
+        if test_deconf is not None:
+            test_extra = format_ranking_lines(test_deconf, indent=' TDeconf ')
         logging.info(format_epoch_summary(
             epoch, args.epochs, optimizer.param_groups[0]['lr'], train_m, val_m,
             saved_best=saved, best_score=max_val_score if saved else None,
-            extra_lines=extra_lines, sep=SEP))
+            extra_lines=extra_lines, sep=SEP,
+            test_m=test_m, test_extra_lines=test_extra))
         train_hist.append(train_m)
         val_row = dict(val_m)
         val_row.update({f'deconf_{k}': deconf[k] for k in rank_keys})
         val_hist.append(val_row)
-        _write_hist(args.save_dir, train_hist, val_hist)
+        if test_m is not None:
+            test_row = dict(test_m)
+            test_row.update({f'deconf_{k}': test_deconf[k] for k in rank_keys})
+            test_hist.append(test_row)
+        _write_hist(args.save_dir, train_hist, val_hist, test_hist)
 
     logging.info(f'Training finished. Best val score={max_val_score:.4f}')
     logging.info(f'Checkpoints: {os.path.join(args.save_dir, "checkpoints")}')
@@ -662,14 +705,48 @@ def _to_device(batch, device):
     return out
 
 
-def _write_hist(save_dir, train_hist, val_hist):
-    """每个 epoch 覆盖写入 metrics-train.txt / metrics-val.txt，字段名和 GETNext 对齐。
+def _deconf_ckpt_metrics(split, m):
+    """Checkpoint 里 deconf 字段，和 GETNext epoch_*_metrics 命名对齐。"""
+    return {
+        f'epoch_{split}_deconf_top1_acc': m['top1'],
+        f'epoch_{split}_deconf_top5_acc': m['top5'],
+        f'epoch_{split}_deconf_top10_acc': m['top10'],
+        f'epoch_{split}_deconf_top20_acc': m['top20'],
+        f'epoch_{split}_deconf_HR1': m['hr1'],
+        f'epoch_{split}_deconf_H5': m['h5'],
+        f'epoch_{split}_deconf_H10': m['h10'],
+        f'epoch_{split}_deconf_NDCG5': m['ndcg5'],
+        f'epoch_{split}_deconf_NDCG10': m['ndcg10'],
+        f'epoch_{split}_deconf_mAP20': m['map20'],
+        f'epoch_{split}_deconf_mrr': m['mrr'],
+    }
+
+
+def _deconf_hist_keys(split):
+    """metrics-val.txt / metrics-test.txt 里 deconf 列表字段名。"""
+    return [
+        (f'{split}_epochs_deconf_top1_acc_list', 'deconf_top1'),
+        (f'{split}_epochs_deconf_top5_acc_list', 'deconf_top5'),
+        (f'{split}_epochs_deconf_top10_acc_list', 'deconf_top10'),
+        (f'{split}_epochs_deconf_top20_acc_list', 'deconf_top20'),
+        (f'{split}_epochs_deconf_hr1_list', 'deconf_hr1'),
+        (f'{split}_epochs_deconf_h5_list', 'deconf_h5'),
+        (f'{split}_epochs_deconf_h10_list', 'deconf_h10'),
+        (f'{split}_epochs_deconf_ndcg5_list', 'deconf_ndcg5'),
+        (f'{split}_epochs_deconf_ndcg10_list', 'deconf_ndcg10'),
+        (f'{split}_epochs_deconf_mAP20_list', 'deconf_map20'),
+        (f'{split}_epochs_deconf_mrr_list', 'deconf_mrr'),
+    ]
+
+
+def _write_hist(save_dir, train_hist, val_hist, test_hist=None):
+    """每个 epoch 覆盖写入 metrics-train/val/test.txt，字段名和 GETNext 对齐。
 
     输入:
         save_dir: str
-        train_hist / val_hist: list[dict]
+        train_hist / val_hist / test_hist: list[dict]
     输出:
-        无返回。写两个文本文件。
+        无返回。写文本文件。
     """
     write_epoch_metrics_txt(
         os.path.join(save_dir, 'metrics-train.txt'), 'train', train_hist,
@@ -681,19 +758,11 @@ def _write_hist(save_dir, train_hist, val_hist):
         ])
     write_epoch_metrics_txt(
         os.path.join(save_dir, 'metrics-val.txt'), 'val', val_hist,
-        extra_keys=[
-            ('val_epochs_deconf_top1_acc_list', 'deconf_top1'),
-            ('val_epochs_deconf_top5_acc_list', 'deconf_top5'),
-            ('val_epochs_deconf_top10_acc_list', 'deconf_top10'),
-            ('val_epochs_deconf_top20_acc_list', 'deconf_top20'),
-            ('val_epochs_deconf_hr1_list', 'deconf_hr1'),
-            ('val_epochs_deconf_h5_list', 'deconf_h5'),
-            ('val_epochs_deconf_h10_list', 'deconf_h10'),
-            ('val_epochs_deconf_ndcg5_list', 'deconf_ndcg5'),
-            ('val_epochs_deconf_ndcg10_list', 'deconf_ndcg10'),
-            ('val_epochs_deconf_mAP20_list', 'deconf_map20'),
-            ('val_epochs_deconf_mrr_list', 'deconf_mrr'),
-        ])
+        extra_keys=_deconf_hist_keys('val'))
+    if test_hist:
+        write_epoch_metrics_txt(
+            os.path.join(save_dir, 'metrics-test.txt'), 'test', test_hist,
+            extra_keys=_deconf_hist_keys('test'))
 
 
 if __name__ == '__main__':

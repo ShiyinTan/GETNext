@@ -21,7 +21,8 @@ from dataloader import load_graph_adj_mtx, load_graph_node_features
 from model import GCN, NodeAttnMap, UserEmbeddings, Time2Vec, CategoryEmbeddings, FuseEmbeddings, TransformerModel
 from param_parser import parameter_parser
 from utils import increment_path, calculate_laplacian_matrix, zipdir, maksed_mse_loss, \
-    batch_last_step_metrics, format_epoch_summary, write_epoch_metrics_txt, epoch_ckpt_metrics
+    batch_last_step_metrics, format_epoch_summary, write_epoch_metrics_txt, epoch_ckpt_metrics, \
+    mean_or_nan
 
 SEP = '-' * 72
 
@@ -80,6 +81,8 @@ def train(args):
     logging.info(f' epochs   : {args.epochs}  batch={args.batch}  lr={args.lr}')
     logging.info(f' train    : {args.data_train}')
     logging.info(f' val      : {args.data_val}')
+    if args.eval_test:
+        logging.info(f' test     : {args.data_test}  (monitor only; ckpt uses val)')
     logging.info(SEP)
 
     # %% ====================== Load data ======================
@@ -87,6 +90,12 @@ def train(args):
     logging.info('[1/4] Loading trajectories & POI graph...')
     train_df = pd.read_csv(args.data_train)
     val_df = pd.read_csv(args.data_val)
+    test_df = None
+    if args.eval_test:
+        if os.path.isfile(args.data_test):
+            test_df = pd.read_csv(args.data_test)
+        else:
+            logging.warning(f'Test CSV not found ({args.data_test}); skipping in-training test eval')
 
     # 步骤2: 加载全局轨迹流图 (由 build_graph.py 从 train 构建)
     raw_A = load_graph_adj_mtx(args.data_adj_mtx)  # (N_poi, N_poi)，边权=转移频次
@@ -122,7 +131,8 @@ def train(args):
     # 步骤4: 邻接矩阵做 GCN 用的随机游走归一化拉普拉斯
     A = calculate_laplacian_matrix(raw_A, mat_type='hat_rw_normd_lap_mat')  # (N_poi, N_poi)
     logging.info(f'        POIs={num_pois}  cats={num_cats}  '
-                 f'train_rows={len(train_df)}  val_rows={len(val_df)}')
+                 f'train_rows={len(train_df)}  val_rows={len(val_df)}'
+                 f'{"" if test_df is None else f"  test_rows={len(test_df)}"}')
 
     # 步骤5: 构建 id ↔ index 映射字典
     nodes_df = pd.read_csv(args.data_node_feats)
@@ -186,15 +196,15 @@ def train(args):
             return (self.traj_seqs[index], self.input_seqs[index], self.label_seqs[index])
 
     class TrajectoryDatasetVal(Dataset):
-        """验证集构造同训练集；过滤训练未见过的 user / POI。"""
-        def __init__(self, df):
+        """验证/测试集构造同训练集；过滤训练未见过的 user / POI。"""
+        def __init__(self, df, split_name='val'):
             self.df = df
             self.traj_seqs = []
             self.input_seqs = []
             self.label_seqs = []
 
             for traj_id in tqdm(set(df['trajectory_id'].tolist()),
-                                desc='Build val set', leave=False, dynamic_ncols=True):
+                                desc=f'Build {split_name} set', leave=False, dynamic_ncols=True):
                 user_id = traj_id.split('_')[0]
 
                 # 跳过训练集中未出现的用户
@@ -236,9 +246,13 @@ def train(args):
     # %% ====================== Define dataloader ======================
     logging.info('[2/4] Building dataloaders...')
     train_dataset = TrajectoryDatasetTrain(train_df)
-    val_dataset = TrajectoryDatasetVal(val_df)
+    val_dataset = TrajectoryDatasetVal(val_df, split_name='val')
+    test_dataset = None
+    if test_df is not None:
+        test_dataset = TrajectoryDatasetVal(test_df, split_name='test')
+    test_n = len(test_dataset) if test_dataset is not None else 0
     logging.info(f'        train_trajs={len(train_dataset)}  val_trajs={len(val_dataset)}  '
-                 f'users={len(user_id2idx_dict)}')
+                 f'test_trajs={test_n}  users={len(user_id2idx_dict)}')
 
     train_loader = DataLoader(train_dataset,
                               batch_size=args.batch,
@@ -250,6 +264,13 @@ def train(args):
                             shuffle=False, drop_last=False,
                             pin_memory=True, num_workers=args.workers,
                             collate_fn=lambda x: x)
+    test_loader = None
+    if test_dataset is not None and len(test_dataset) > 0:
+        test_loader = DataLoader(test_dataset,
+                                 batch_size=args.batch,
+                                 shuffle=False, drop_last=False,
+                                 pin_memory=True, num_workers=args.workers,
+                                 collate_fn=lambda x: x)
 
     # %% ====================== Build Models ======================
     # 步骤6: 图特征/邻接转 Tensor，并构建各子模块
@@ -367,10 +388,11 @@ def train(args):
 
         return input_seq_embed
 
-    def adjust_pred_prob_by_graph(y_pred_poi):
+    def adjust_pred_prob_by_graph(y_pred_poi, batch_input_seqs):
         """用轨迹流图注意力校正 Transformer 的下一 POI logits。
         Args:
           y_pred_poi: (B, T_max, N_poi)，Transformer 原始 POI 打分
+          batch_input_seqs: list[list[poi_idx]]，长度 B
         Returns:
           y_pred_poi_adjusted: (B, T_max, N_poi)
             对每个时间步 j: adjusted[i,j,:] = attn_map[当前POI_j, :] + y_pred_poi[i,j,:]
@@ -378,7 +400,7 @@ def train(args):
         y_pred_poi_adjusted = torch.zeros_like(y_pred_poi)  # (B, T_max, N_poi)
         attn_map = node_attn_model(X, A)  # (N_poi, N_poi)
 
-        for i in range(len(batch_seq_lens)):
+        for i in range(len(batch_input_seqs)):
             traj_i_input = batch_input_seqs[i]  # list，长度 T_i，元素为当前步 poi_idx
             for j in range(len(traj_i_input)):
                 # 取「当前 POI」对应的一行转移先验，加到该步 logits 上
@@ -395,6 +417,127 @@ def train(args):
     embed_fuse_model1 = embed_fuse_model1.to(device=args.device)
     embed_fuse_model2 = embed_fuse_model2.to(device=args.device)
     seq_model = seq_model.to(device=args.device)
+
+    def eval_split(loader, split_name, max_batches, epoch):
+        """Val/test eval: no backward. Returns the same metric dict as an epoch row."""
+        parts = {k: [] for k in (
+            'top1', 'top5', 'top10', 'top20', 'ndcg5', 'ndcg10', 'map20', 'mrr',
+            'loss', 'poi', 'time', 'cat')}
+        src_mask = seq_model.generate_square_subsequent_mask(args.batch).to(args.device)
+        pbar = tqdm(loader,
+                    desc=f'Epoch {epoch + 1}/{args.epochs} {split_name:<4}',
+                    leave=False, dynamic_ncols=True)
+        with torch.no_grad():
+            for b_idx, batch in enumerate(pbar):
+                if max_batches and b_idx >= max_batches:
+                    break
+                if len(batch) != args.batch:
+                    src_mask = seq_model.generate_square_subsequent_mask(len(batch)).to(args.device)
+    
+                batch_input_seqs = []
+                batch_seq_lens = []
+                batch_seq_embeds = []
+                batch_seq_labels_poi = []
+                batch_seq_labels_time = []
+                batch_seq_labels_cat = []
+    
+                poi_embeddings = poi_embed_model(X, A)
+    
+                for sample in batch:
+                    input_seq = [each[0] for each in sample[1]]
+                    label_seq = [each[0] for each in sample[2]]
+                    label_seq_time = [each[1] for each in sample[2]]
+                    label_seq_cats = [poi_idx2cat_idx_dict[each] for each in label_seq]
+                    input_seq_embed = torch.stack(input_traj_to_embeddings(sample, poi_embeddings))
+                    batch_seq_embeds.append(input_seq_embed)
+                    batch_seq_lens.append(len(input_seq))
+                    batch_input_seqs.append(input_seq)
+                    batch_seq_labels_poi.append(torch.LongTensor(label_seq))
+                    batch_seq_labels_time.append(torch.FloatTensor(label_seq_time))
+                    batch_seq_labels_cat.append(torch.LongTensor(label_seq_cats))
+    
+                batch_padded = pad_sequence(batch_seq_embeds, batch_first=True, padding_value=-1)
+                label_padded_poi = pad_sequence(batch_seq_labels_poi, batch_first=True, padding_value=-1)
+                label_padded_time = pad_sequence(batch_seq_labels_time, batch_first=True, padding_value=-1)
+                label_padded_cat = pad_sequence(batch_seq_labels_cat, batch_first=True, padding_value=-1)
+    
+                x = batch_padded.to(device=args.device, dtype=torch.float)
+                y_poi = label_padded_poi.to(device=args.device, dtype=torch.long)
+                y_time = label_padded_time.to(device=args.device, dtype=torch.float)
+                y_cat = label_padded_cat.to(device=args.device, dtype=torch.long)
+                y_pred_poi, y_pred_time, y_pred_cat = seq_model(x, src_mask)
+                y_pred_poi_adjusted = adjust_pred_prob_by_graph(y_pred_poi, batch_input_seqs)
+    
+                loss_poi = criterion_poi(y_pred_poi_adjusted.transpose(1, 2), y_poi)
+                loss_time = criterion_time(torch.squeeze(y_pred_time), y_time)
+                loss_cat = criterion_cat(y_pred_cat.transpose(1, 2), y_cat)
+                loss = loss_poi + loss_time * args.time_loss_weight + loss_cat
+    
+                batch_m = batch_last_step_metrics(
+                    y_poi.detach().cpu().numpy(),
+                    y_pred_poi_adjusted.detach().cpu().numpy(),
+                    batch_seq_lens)
+                parts['top1'].append(batch_m['top1'])
+                parts['top5'].append(batch_m['top5'])
+                parts['top10'].append(batch_m['top10'])
+                parts['top20'].append(batch_m['top20'])
+                parts['ndcg5'].append(batch_m['ndcg5'])
+                parts['ndcg10'].append(batch_m['ndcg10'])
+                parts['map20'].append(batch_m['map20'])
+                parts['mrr'].append(batch_m['mrr'])
+                parts['loss'].append(loss.detach().cpu().numpy())
+                parts['poi'].append(loss_poi.detach().cpu().numpy())
+                parts['time'].append(loss_time.detach().cpu().numpy())
+                parts['cat'].append(loss_cat.detach().cpu().numpy())
+                pbar.set_postfix(
+                    loss=f'{loss.item():.2f}',
+                    avg=f'{float(np.mean(parts["loss"])):.2f}',
+                    top1=f'{batch_m["top1"]:.3f}',
+                    refresh=False)
+    
+                if args.verbose and (b_idx % max(args.batch * 2, 1)) == 0:
+                    sample_idx = 0
+                    batch_pred_pois_wo_attn = y_pred_poi.detach().cpu().numpy()
+                    batch_pred_pois = y_pred_poi_adjusted.detach().cpu().numpy()
+                    batch_pred_times = y_pred_time.detach().cpu().numpy()
+                    batch_pred_cats = y_pred_cat.detach().cpu().numpy()
+                    logging.debug(
+                        f'Epoch:{epoch}, batch:{b_idx}, '
+                        f'{split_name}_batch_loss:{loss.item():.2f}, '
+                        f'{split_name}_batch_top1_acc:{batch_m["top1"]:.2f}, '
+                        f'{split_name}_move_loss:{np.mean(parts["loss"]):.2f} \n'
+                        f'{split_name}_move_poi_loss:{np.mean(parts["poi"]):.2f} \n'
+                        f'{split_name}_move_time_loss:{np.mean(parts["time"]):.2f} \n'
+                        f'{split_name}_move_top1_acc:{np.mean(parts["top1"]):.4f} \n'
+                        f'{split_name}_move_top5_acc:{np.mean(parts["top5"]):.4f} \n'
+                        f'{split_name}_move_top10_acc:{np.mean(parts["top10"]):.4f} \n'
+                        f'{split_name}_move_top20_acc:{np.mean(parts["top20"]):.4f} \n'
+                        f'{split_name}_move_mAP20:{np.mean(parts["map20"]):.4f} \n'
+                        f'{split_name}_move_MRR:{np.mean(parts["mrr"]):.4f} \n'
+                        f'traj_id:{batch[sample_idx][0]}\n'
+                        f'input_seq:{batch[sample_idx][1]}\n'
+                        f'label_seq:{batch[sample_idx][2]}\n'
+                        f'pred_seq_poi_wo_attn:{list(np.argmax(batch_pred_pois_wo_attn, axis=2)[sample_idx][:batch_seq_lens[sample_idx]])} \n'
+                        f'pred_seq_poi:{list(np.argmax(batch_pred_pois, axis=2)[sample_idx][:batch_seq_lens[sample_idx]])} \n'
+                        f'label_seq_cat:{[poi_idx2cat_idx_dict[each[0]] for each in batch[sample_idx][2]]}\n'
+                        f'pred_seq_cat:{list(np.argmax(batch_pred_cats, axis=2)[sample_idx][:batch_seq_lens[sample_idx]])} \n'
+                        f'label_seq_time:{list(batch_seq_labels_time[sample_idx].numpy()[:batch_seq_lens[sample_idx]])}\n'
+                        f'pred_seq_time:{list(np.squeeze(batch_pred_times)[sample_idx][:batch_seq_lens[sample_idx]])}'
+                    )
+        return {
+            'loss': mean_or_nan(parts['loss']),
+            'poi': mean_or_nan(parts['poi']),
+            'time': mean_or_nan(parts['time']),
+            'cat': mean_or_nan(parts['cat']),
+            'top1': mean_or_nan(parts['top1']),
+            'top5': mean_or_nan(parts['top5']),
+            'top10': mean_or_nan(parts['top10']),
+            'top20': mean_or_nan(parts['top20']),
+            'ndcg5': mean_or_nan(parts['ndcg5']),
+            'ndcg10': mean_or_nan(parts['ndcg10']),
+            'map20': mean_or_nan(parts['map20']),
+            'mrr': mean_or_nan(parts['mrr']),
+        }
 
     # %% Loop epoch
     # For plotting
@@ -422,6 +565,7 @@ def train(args):
     val_epochs_poi_loss_list = []
     val_epochs_time_loss_list = []
     val_epochs_cat_loss_list = []
+    test_hist = []
     # For saving ckpt
     max_val_score = -np.inf
 
@@ -456,6 +600,8 @@ def train(args):
                           leave=False,
                           dynamic_ncols=True)
         for b_idx, batch in enumerate(train_pbar):
+            if args.max_batches and b_idx >= args.max_batches:
+                break
             if len(batch) != args.batch:
                 src_mask = seq_model.generate_square_subsequent_mask(len(batch)).to(args.device)
 
@@ -504,7 +650,7 @@ def train(args):
             # y_pred_poi: (B, T_max, N_poi), y_pred_time: (B, T_max, 1), y_pred_cat: (B, T_max, num_cats)
 
             # 步骤11: 轨迹流图注意力校正 POI logits → (B, T_max, N_poi)
-            y_pred_poi_adjusted = adjust_pred_prob_by_graph(y_pred_poi)
+            y_pred_poi_adjusted = adjust_pred_prob_by_graph(y_pred_poi, batch_input_seqs)
 
             # 步骤12: 多任务损失
             # CE 需要 (B, C, T)，故对 poi/cat 做 transpose(1,2)
@@ -581,126 +727,11 @@ def train(args):
         embed_fuse_model1.eval()
         embed_fuse_model2.eval()
         seq_model.eval()
-        val_batches_top1_acc_list = []
-        val_batches_top5_acc_list = []
-        val_batches_top10_acc_list = []
-        val_batches_top20_acc_list = []
-        val_batches_ndcg5_list = []
-        val_batches_ndcg10_list = []
-        val_batches_mAP20_list = []
-        val_batches_mrr_list = []
-        val_batches_loss_list = []
-        val_batches_poi_loss_list = []
-        val_batches_time_loss_list = []
-        val_batches_cat_loss_list = []
-        src_mask = seq_model.generate_square_subsequent_mask(args.batch).to(args.device)
-        # ---------- 验证 batch 循环 (无反向传播，流程与训练对称) ----------
-        val_pbar = tqdm(val_loader,
-                        desc=f'Epoch {epoch + 1}/{args.epochs} val  ',
-                        leave=False,
-                        dynamic_ncols=True)
-        for vb_idx, batch in enumerate(val_pbar):
-            if len(batch) != args.batch:
-                src_mask = seq_model.generate_square_subsequent_mask(len(batch)).to(args.device)
-
-            batch_input_seqs = []
-            batch_seq_lens = []
-            batch_seq_embeds = []
-            batch_seq_labels_poi = []
-            batch_seq_labels_time = []
-            batch_seq_labels_cat = []
-
-            poi_embeddings = poi_embed_model(X, A)  # (N_poi, poi_embed_dim)
-
-            for sample in batch:
-                traj_id = sample[0]
-                input_seq = [each[0] for each in sample[1]]
-                label_seq = [each[0] for each in sample[2]]
-                input_seq_time = [each[1] for each in sample[1]]
-                label_seq_time = [each[1] for each in sample[2]]
-                label_seq_cats = [poi_idx2cat_idx_dict[each] for each in label_seq]
-                input_seq_embed = torch.stack(input_traj_to_embeddings(sample, poi_embeddings))  # (T_i, D)
-                batch_seq_embeds.append(input_seq_embed)
-                batch_seq_lens.append(len(input_seq))
-                batch_input_seqs.append(input_seq)
-                batch_seq_labels_poi.append(torch.LongTensor(label_seq))
-                batch_seq_labels_time.append(torch.FloatTensor(label_seq_time))
-                batch_seq_labels_cat.append(torch.LongTensor(label_seq_cats))
-
-            # pad → (B, T_max, D) / (B, T_max)
-            batch_padded = pad_sequence(batch_seq_embeds, batch_first=True, padding_value=-1)
-            label_padded_poi = pad_sequence(batch_seq_labels_poi, batch_first=True, padding_value=-1)
-            label_padded_time = pad_sequence(batch_seq_labels_time, batch_first=True, padding_value=-1)
-            label_padded_cat = pad_sequence(batch_seq_labels_cat, batch_first=True, padding_value=-1)
-
-            x = batch_padded.to(device=args.device, dtype=torch.float)
-            y_poi = label_padded_poi.to(device=args.device, dtype=torch.long)
-            y_time = label_padded_time.to(device=args.device, dtype=torch.float)
-            y_cat = label_padded_cat.to(device=args.device, dtype=torch.long)
-            y_pred_poi, y_pred_time, y_pred_cat = seq_model(x, src_mask)
-            # y_pred_poi: (B, T_max, N_poi)
-
-            # 图注意力校正 POI logits
-            y_pred_poi_adjusted = adjust_pred_prob_by_graph(y_pred_poi)
-
-            loss_poi = criterion_poi(y_pred_poi_adjusted.transpose(1, 2), y_poi)
-            loss_time = criterion_time(torch.squeeze(y_pred_time), y_time)
-            loss_cat = criterion_cat(y_pred_cat.transpose(1, 2), y_cat)
-            loss = loss_poi + loss_time * args.time_loss_weight + loss_cat
-
-            # 只评最后时间步的 next-POI 指标
-            batch_label_pois = y_poi.detach().cpu().numpy()
-            batch_pred_pois = y_pred_poi_adjusted.detach().cpu().numpy()
-            batch_pred_times = y_pred_time.detach().cpu().numpy()
-            batch_pred_cats = y_pred_cat.detach().cpu().numpy()
-            batch_m = batch_last_step_metrics(batch_label_pois, batch_pred_pois, batch_seq_lens)
-            batch_top1 = batch_m['top1']
-            val_batches_top1_acc_list.append(batch_m['top1'])
-            val_batches_top5_acc_list.append(batch_m['top5'])
-            val_batches_top10_acc_list.append(batch_m['top10'])
-            val_batches_top20_acc_list.append(batch_m['top20'])
-            val_batches_ndcg5_list.append(batch_m['ndcg5'])
-            val_batches_ndcg10_list.append(batch_m['ndcg10'])
-            val_batches_mAP20_list.append(batch_m['map20'])
-            val_batches_mrr_list.append(batch_m['mrr'])
-            val_batches_loss_list.append(loss.detach().cpu().numpy())
-            val_batches_poi_loss_list.append(loss_poi.detach().cpu().numpy())
-            val_batches_time_loss_list.append(loss_time.detach().cpu().numpy())
-            val_batches_cat_loss_list.append(loss_cat.detach().cpu().numpy())
-
-            val_pbar.set_postfix(
-                loss=f'{loss.item():.2f}',
-                avg=f'{float(np.mean(val_batches_loss_list)):.2f}',
-                top1=f'{batch_top1:.3f}',
-                refresh=False)
-
-            if args.verbose and (vb_idx % max(args.batch * 2, 1)) == 0:
-                sample_idx = 0
-                batch_pred_pois_wo_attn = y_pred_poi.detach().cpu().numpy()
-                logging.debug(
-                    f'Epoch:{epoch}, batch:{vb_idx}, '
-                    f'val_batch_loss:{loss.item():.2f}, '
-                    f'val_batch_top1_acc:{batch_top1:.2f}, '
-                    f'val_move_loss:{np.mean(val_batches_loss_list):.2f} \n'
-                    f'val_move_poi_loss:{np.mean(val_batches_poi_loss_list):.2f} \n'
-                    f'val_move_time_loss:{np.mean(val_batches_time_loss_list):.2f} \n'
-                    f'val_move_top1_acc:{np.mean(val_batches_top1_acc_list):.4f} \n'
-                    f'val_move_top5_acc:{np.mean(val_batches_top5_acc_list):.4f} \n'
-                    f'val_move_top10_acc:{np.mean(val_batches_top10_acc_list):.4f} \n'
-                    f'val_move_top20_acc:{np.mean(val_batches_top20_acc_list):.4f} \n'
-                    f'val_move_mAP20:{np.mean(val_batches_mAP20_list):.4f} \n'
-                    f'val_move_MRR:{np.mean(val_batches_mrr_list):.4f} \n'
-                    f'traj_id:{batch[sample_idx][0]}\n'
-                    f'input_seq:{batch[sample_idx][1]}\n'
-                    f'label_seq:{batch[sample_idx][2]}\n'
-                    f'pred_seq_poi_wo_attn:{list(np.argmax(batch_pred_pois_wo_attn, axis=2)[sample_idx][:batch_seq_lens[sample_idx]])} \n'
-                    f'pred_seq_poi:{list(np.argmax(batch_pred_pois, axis=2)[sample_idx][:batch_seq_lens[sample_idx]])} \n'
-                    f'label_seq_cat:{[poi_idx2cat_idx_dict[each[0]] for each in batch[sample_idx][2]]}\n'
-                    f'pred_seq_cat:{list(np.argmax(batch_pred_cats, axis=2)[sample_idx][:batch_seq_lens[sample_idx]])} \n'
-                    f'label_seq_time:{list(batch_seq_labels_time[sample_idx].numpy()[:batch_seq_lens[sample_idx]])}\n'
-                    f'pred_seq_time:{list(np.squeeze(batch_pred_times)[sample_idx][:batch_seq_lens[sample_idx]])}'
-                )
-        # valid end --------------------------------------------------------------------------------------------------------
+        # Val + optional test (test is monitor-only; checkpoint still uses val)
+        val_m = eval_split(val_loader, 'val', args.max_val_batches, epoch)
+        test_m = None
+        if test_loader is not None:
+            test_m = eval_split(test_loader, 'test', args.max_test_batches, epoch)
 
         # Calculate epoch metrics
         epoch_train_top1_acc = np.mean(train_batches_top1_acc_list)
@@ -715,18 +746,6 @@ def train(args):
         epoch_train_poi_loss = np.mean(train_batches_poi_loss_list)
         epoch_train_time_loss = np.mean(train_batches_time_loss_list)
         epoch_train_cat_loss = np.mean(train_batches_cat_loss_list)
-        epoch_val_top1_acc = np.mean(val_batches_top1_acc_list)
-        epoch_val_top5_acc = np.mean(val_batches_top5_acc_list)
-        epoch_val_top10_acc = np.mean(val_batches_top10_acc_list)
-        epoch_val_top20_acc = np.mean(val_batches_top20_acc_list)
-        epoch_val_ndcg5 = np.mean(val_batches_ndcg5_list)
-        epoch_val_ndcg10 = np.mean(val_batches_ndcg10_list)
-        epoch_val_mAP20 = np.mean(val_batches_mAP20_list)
-        epoch_val_mrr = np.mean(val_batches_mrr_list)
-        epoch_val_loss = np.mean(val_batches_loss_list)
-        epoch_val_poi_loss = np.mean(val_batches_poi_loss_list)
-        epoch_val_time_loss = np.mean(val_batches_time_loss_list)
-        epoch_val_cat_loss = np.mean(val_batches_cat_loss_list)
 
         # Save metrics to list
         train_epochs_loss_list.append(epoch_train_loss)
@@ -741,22 +760,24 @@ def train(args):
         train_epochs_ndcg10_list.append(epoch_train_ndcg10)
         train_epochs_mAP20_list.append(epoch_train_mAP20)
         train_epochs_mrr_list.append(epoch_train_mrr)
-        val_epochs_loss_list.append(epoch_val_loss)
-        val_epochs_poi_loss_list.append(epoch_val_poi_loss)
-        val_epochs_time_loss_list.append(epoch_val_time_loss)
-        val_epochs_cat_loss_list.append(epoch_val_cat_loss)
-        val_epochs_top1_acc_list.append(epoch_val_top1_acc)
-        val_epochs_top5_acc_list.append(epoch_val_top5_acc)
-        val_epochs_top10_acc_list.append(epoch_val_top10_acc)
-        val_epochs_top20_acc_list.append(epoch_val_top20_acc)
-        val_epochs_ndcg5_list.append(epoch_val_ndcg5)
-        val_epochs_ndcg10_list.append(epoch_val_ndcg10)
-        val_epochs_mAP20_list.append(epoch_val_mAP20)
-        val_epochs_mrr_list.append(epoch_val_mrr)
+        val_epochs_loss_list.append(val_m['loss'])
+        val_epochs_poi_loss_list.append(val_m['poi'])
+        val_epochs_time_loss_list.append(val_m['time'])
+        val_epochs_cat_loss_list.append(val_m['cat'])
+        val_epochs_top1_acc_list.append(val_m['top1'])
+        val_epochs_top5_acc_list.append(val_m['top5'])
+        val_epochs_top10_acc_list.append(val_m['top10'])
+        val_epochs_top20_acc_list.append(val_m['top20'])
+        val_epochs_ndcg5_list.append(val_m['ndcg5'])
+        val_epochs_ndcg10_list.append(val_m['ndcg10'])
+        val_epochs_mAP20_list.append(val_m['map20'])
+        val_epochs_mrr_list.append(val_m['mrr'])
+        if test_m is not None:
+            test_hist.append(test_m)
 
-        # 用验证损失调度学习率；用 top1/top20 组合分选 best ckpt
-        monitor_loss = epoch_val_loss
-        monitor_score = np.mean(epoch_val_top1_acc * 4 + epoch_val_top20_acc)
+        # 用验证损失调度学习率；用 top1/top20 组合分选 best ckpt（不用 test）
+        monitor_loss = val_m['loss']
+        monitor_score = np.mean(val_m['top1'] * 4 + val_m['top20'])
 
         # Learning rate schuduler
         lr_scheduler.step(monitor_loss)
@@ -769,14 +790,6 @@ def train(args):
             'top10': epoch_train_top10_acc, 'top20': epoch_train_top20_acc,
             'ndcg5': epoch_train_ndcg5, 'ndcg10': epoch_train_ndcg10,
             'map20': epoch_train_mAP20, 'mrr': epoch_train_mrr,
-        }
-        val_m = {
-            'loss': epoch_val_loss, 'poi': epoch_val_poi_loss,
-            'time': epoch_val_time_loss, 'cat': epoch_val_cat_loss,
-            'top1': epoch_val_top1_acc, 'top5': epoch_val_top5_acc,
-            'top10': epoch_val_top10_acc, 'top20': epoch_val_top20_acc,
-            'ndcg5': epoch_val_ndcg5, 'ndcg10': epoch_val_ndcg10,
-            'map20': epoch_val_mAP20, 'mrr': epoch_val_mrr,
         }
 
         # Save poi and user embeddings
@@ -841,21 +854,27 @@ def train(args):
                 'epoch_train_metrics': epoch_ckpt_metrics('train', train_m),
                 'epoch_val_metrics': epoch_ckpt_metrics('val', val_m),
             }
+            if test_m is not None:
+                state_dict['epoch_test_metrics'] = epoch_ckpt_metrics('test', test_m)
             model_save_dir = os.path.join(args.save_dir, 'checkpoints')
             # Save best val score epoch
             if monitor_score >= max_val_score:
                 if not os.path.exists(model_save_dir): os.makedirs(model_save_dir)
                 torch.save(state_dict, rf"{model_save_dir}/best_epoch.state.pt")
                 with open(rf"{model_save_dir}/best_epoch.txt", 'w') as f:
-                    print(state_dict['epoch_val_metrics'], file=f)
+                    dump = dict(state_dict['epoch_val_metrics'])
+                    if test_m is not None:
+                        dump.update(state_dict['epoch_test_metrics'])
+                    print(dump, file=f)
                 max_val_score = monitor_score
                 saved_best = True
 
         logging.info(format_epoch_summary(
             epoch, args.epochs, current_lr, train_m, val_m,
-            saved_best=saved_best, best_score=max_val_score if saved_best else None))
+            saved_best=saved_best, best_score=max_val_score if saved_best else None,
+            test_m=test_m))
 
-        # Save train/val metrics for plotting purpose
+        # Save train/val/test metrics for plotting purpose
         write_epoch_metrics_txt(
             os.path.join(args.save_dir, 'metrics-train.txt'), 'train',
             [{'loss': l, 'poi': p, 'time': t, 'cat': c,
@@ -880,6 +899,9 @@ def train(args):
                  val_epochs_top10_acc_list, val_epochs_top20_acc_list,
                  val_epochs_ndcg5_list, val_epochs_ndcg10_list,
                  val_epochs_mAP20_list, val_epochs_mrr_list)])
+        if test_hist:
+            write_epoch_metrics_txt(
+                os.path.join(args.save_dir, 'metrics-test.txt'), 'test', test_hist)
 
     logging.info(f'Training finished. Best val score={max_val_score:.4f}')
     logging.info(f'Checkpoints: {os.path.join(args.save_dir, "checkpoints")}')

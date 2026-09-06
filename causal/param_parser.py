@@ -44,6 +44,12 @@ def parameter_parser():
                         help='训练轨迹 CSV')
     parser.add_argument('--data-val', type=str, default='dataset/NYC/NYC_val.csv',
                         help='验证轨迹 CSV')
+    parser.add_argument('--data-test', type=str, default='dataset/NYC/NYC_test.csv',
+                        help='测试轨迹 CSV（每个 epoch 在 val 之后评一次，不参与选 checkpoint）')
+    parser.add_argument('--eval-test', dest='eval_test', action='store_true',
+                        default=True, help='每个 epoch 的 val 之后跑 test（默认开）')
+    parser.add_argument('--no-eval-test', dest='eval_test', action='store_false',
+                        help='训练时不评 test')
     parser.add_argument('--data-node-feats', type=str, default='dataset/NYC/graph_X.csv',
                         help='地点表：id、签到次数、类别、经纬度（不用邻接矩阵）')
     parser.add_argument('--short-traj-thres', type=int, default=2,
@@ -129,6 +135,8 @@ def parameter_parser():
                         help='每个 epoch 最多训练多少个 batch，0 表示全部（冒烟用）')
     parser.add_argument('--max-val-batches', type=int, default=0,
                         help='每个 epoch 最多验证多少个 batch，0 表示全部')
+    parser.add_argument('--max-test-batches', type=int, default=0,
+                        help='每个 epoch 最多测试多少个 batch，0 表示全部')
     parser.add_argument('--save-weights', action='store_true', default=True, help='是否存 checkpoint')
     parser.add_argument('--project', default='runs/causal',
                         help='输出根目录，和 GETNext 的 runs/train 分开')

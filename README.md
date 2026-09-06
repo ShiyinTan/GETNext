@@ -329,6 +329,7 @@ python train.py \
 | `--lr` | Learning rate | `0.001` |
 | `--data-train` | Train CSV | `dataset/NYC/NYC_train.csv` |
 | `--data-val` | Val CSV | `dataset/NYC/NYC_val.csv` |
+| `--data-test` | Test CSV (eval after each val) | `dataset/NYC/NYC_test.csv` |
 | `--data-adj-mtx` | Graph adjacency | `dataset/NYC/graph_A.csv` |
 | `--data-node-feats` | Graph node features | `dataset/NYC/graph_X.csv` |
 | `--device` | Device (`cuda` / `cuda:0` / `cpu`) | auto |
@@ -337,6 +338,7 @@ python train.py \
 | `--exist-ok` | Do not auto-increment run name | off |
 | `--verbose` | Noisy per-batch dumps | off |
 | `--workers` | DataLoader workers | `0` |
+| `--no-eval-test` | Skip in-training test eval | off (test runs after val) |
 
 ### Outputs
 
@@ -346,6 +348,7 @@ runs/train/<name>/
   ├── log_training.txt
   ├── metrics-train.txt
   ├── metrics-val.txt
+  ├── metrics-test.txt         # written each epoch; checkpoint still selected on val
   ├── checkpoints/best_epoch.state.pt
   └── checkpoints/best_epoch.txt
 ```

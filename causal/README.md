@@ -390,6 +390,10 @@ Do not pick checkpoints with deconfounded Acc (spec §7). Training monitors **fa
 | `--area-grid-deg` | lat/lon grid | `0.02` |
 | `--conf-aux-ce` | optional weak CE on `s_conf` | off |
 | `--max-batches` | smoke cap on train batches / epoch | `0` (all) |
+| `--max-val-batches` | smoke cap on val batches / epoch | `0` (all) |
+| `--max-test-batches` | smoke cap on test batches / epoch | `0` (all) |
+| `--data-test` | test CSV, evaluated after every val | `dataset/NYC/NYC_test.csv` |
+| `--no-eval-test` | skip in-training test eval | off |
 | `--project` | run root | `runs/causal` |
 | `--no-cuda` | force CPU | off |
 
@@ -403,6 +407,7 @@ runs/causal/<name>/
   ├── log_training.txt
   ├── metrics-train.txt        # GETNext 同款字段 + HR/H/NDCG + pref/conf/adv/recon
   ├── metrics-val.txt          # GETNext 同款 factual 字段 + HR/H/NDCG + deconf
+  ├── metrics-test.txt         # 每个 epoch 在 val 之后评 test；选 checkpoint 仍只用 val
   ├── poi_table_meta.pkl
   ├── checkpoints/best_epoch.state.pt
   └── predictions/
