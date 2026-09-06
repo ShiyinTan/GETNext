@@ -7,8 +7,8 @@
 
 1. **用户走过的地点序列**（历史 H）送进 Transformer，得到一个向量 `h`（“读完这条轨迹后的摘要”）。
 2. 把 `h` **拆成两份**：`h_z` 尽量只表示兴趣，`h_c` 尽量表示近/热/区等混杂。
-3. 对每个候选地点打两个分再相加：`s = 兴趣分 s_pref + 混杂分 s_conf`。
-4. 训练时：总分要能猜对下一站；兴趣分要在「一样远」的地点里比出偏好；混杂分要去学距离/热度；并且 `h_z` 不该轻易猜出混杂。
+3. 对每个候选地点打分：factual 是 `s_pref + s_conf(含转移热度) + s_rel(残差相关)`；deconf 只用 `s_pref`（不加 `s_rel`）。
+4. 训练时：总分要能猜对下一站；兴趣分要在「一样远」的地点里比出偏好；混杂分要去学距离/热度/转移热度；并且 `h_z` 不该轻易猜出混杂。
 5. 预测时出两套榜：**factual**（真实约束下下一站）和 **deconf**（把近/热拿掉后兴趣指向谁）。
 
 对应文件（从上到下读即可）：
@@ -54,7 +54,8 @@
 | `h_c` | `(B, T, d_c)` | 混杂摘要 |
 | `s` / `s_pref` / `s_conf` | `(B, T, N)` | 对每个候选 POI 的分 |
 | `C` 表 `dist_bin` / `dist_km` | `(N, N)` | 起点→终点距离桶 / 公里 |
-| `log_pop` / `pop_bin` / `area_id` | `(N,)` | 每个 POI 的热度/区域 |
+| `log_pop` / `log_tpop` / `pop_bin` / `area_id` | `(N,)` | 签到热度 / 转移入度热度 / 区域 |
+| `a_rel` | `(N, N)` | graph_A 去掉热度+距离后的残差相关 |
 | `e_p` 权重 | `(N, d_z)` | POI embedding，和输入查表绑定 |
 
 符号对照：
@@ -64,8 +65,9 @@
 - `C`：混杂（距离 `c_acc`、热度 `c_pop`、区域 `c_area`、时刻 `c_hour`）
 - `h_z`：兴趣代理；`h_c`：混杂摘要
 - `s_pref`：兴趣通道；`s_conf`：混杂通道
-- 总分：`s = w_pref * s_pref + w_conf * s_conf`（默认两个权重都是 1，等于附录 D 的直接相加）
-- `s_conf` 内部：`w_acc * 距离 + w_pop * 热度 + w_area * 区域 + w_ctx * 情境`（默认也全是 1）
+- 总分（factual）：`s = w_pref * s_pref + w_conf * s_conf + w_rel * s_rel`
+- `s_conf` 内部：`w_acc * 距离 + w_pop * 签到热度 + w_tpop * 转移热度 + w_area * 区域 + w_ctx * 情境`
+- `s_rel`：graph_A 残差相关，**只加在 factual**；deconf 三种模式都不加
 
 ### 分数权重：加了超参，但不要六个一起搜
 
@@ -75,7 +77,8 @@
 |------|------|------|
 | `--w-pref` | 兴趣通道在总分里的音量 | 保持 1 |
 | `--w-conf` | 混杂通道在总分里的音量 | **唯一建议搜索的**，例如 `{0.25, 0.5, 1, 2}` |
-| `--w-acc` / `--w-pop` / `--w-area` / `--w-ctx` | `s_conf` 里四项谁更响 | 训练保持 1；设 0 做消融 |
+| `--w-acc` / `--w-pop` / `--w-tpop` / `--w-area` / `--w-ctx` | `s_conf` 里各项谁更响 | 训练保持 1；设 0 做消融 |
+| `--w-rel` | factual 里残差相关 | 训练保持 1；`--w-rel 0` 关掉 A_rel |
 
 为什么不用网格搜这 6 个：
 
@@ -93,8 +96,10 @@ python causal/predict.py --checkpoint ... --w-conf 2.0 --no-cuda
 消融（预测时关掉某一项，看 Acc 掉多少）：
 
 ```bash
-python causal/predict.py --checkpoint ... --w-acc 0 --no-cuda   # 不要距离
-python causal/predict.py --checkpoint ... --w-pop 0 --no-cuda   # 不要热度
+python causal/predict.py --checkpoint ... --w-acc 0 --no-cuda    # 不要距离
+python causal/predict.py --checkpoint ... --w-pop 0 --no-cuda    # 不要签到热度
+python causal/predict.py --checkpoint ... --w-tpop 0 --no-cuda   # 不要转移热度 A_pop
+python causal/predict.py --checkpoint ... --w-rel 0 --no-cuda    # 不要残差相关 A_rel
 ```
 
 `lambda_*`（损失权重）和 `w_*`（分数音量）不是一回事：前者管训练时哪项 loss 更用力，后者管打分时哪路更响。
@@ -113,9 +118,9 @@ Run it next to GETNext, using the same NYC / TKY / Gowalla CSVs.
 | GETNext | Causal (this folder) |
 |---------|----------------------|
 | GCN(`checkin_cnt`, trajectory-flow `A`) as `e_p` | `nn.Embedding` as `e_p` (Appendix A / D.8) |
-| `NodeAttnMap` added to POI logits | no graph prior on `h_z` |
+| `NodeAttnMap` added to POI logits | `graph_A` split: dest in-degree `A_pop` → `s_conf`; residual relatedness `A_rel` → factual `s_rel` only. **Not** dumped into `h_z` |
 | tokens = user/POI/time/cat only | same tokens; **C is not concatenated into H** (D.3.4) |
-| single CE over a fused logit | `s = s_pref + s_conf` with channel losses |
+| single CE over a fused logit | `s = s_pref + s_conf [+ s_rel on factual]` with channel losses |
 | one ranking | **factual** and **deconfounded** rankings (D.5, §7) |
 
 Pipeline (same shape as GETNext):
@@ -126,15 +131,20 @@ CSV trajectories
     → Transformer encoder (causal mask)
     → split h → (h_z, h_c)
     → s_pref = <h_z, e_p>
-    → s_conf = w_acc g_acc + w_pop g_pop + w_area g_area + w_ctx <W_c h_c, ψ(p)>
-    → s = w_pref s_pref + w_conf s_conf     # defaults all 1 (Appendix D)
+    → s_conf = w_acc g_acc + w_pop g_pop + w_tpop g_tpop + w_area g_area + w_ctx <W_c h_c, ψ(p)>
+    → s_rel  = g_rel(A_rel[origin, ·])     # factual only
+    → s = w_pref s_pref + w_conf s_conf + w_rel s_rel
     → L = L_main + λ_pref L_pref + λ_conf L_conf + λ_adv L_adv + λ_recon L_recon
+          + λ_cat L_cat + λ_time L_time     # λ_time default 10 (MSE, same as GETNext)
 ```
 
 `L_main` is CE on **total** `s` (fits `P(Y|H,C)`).
 `L_pref` is same-distance-band CE on `s_pref` only.
-`L_conf` aligns `s_conf` with a stop-grad hand-crafted `g̃` (near / popular / same-area).
-`L_adv` / `L_recon` use a GRL so `h_z ≁ C` while `h_c` reconstructs discrete `C`.
+`L_conf` aligns `s_conf` with a stop-grad hand-crafted `g̃` (near / check-in pop / **transition pop** / same-area). `A_rel` is **not** in `g̃`.
+`L_adv` / `L_recon` use a GRL so `h_z` cannot predict discrete `C` while `h_c` reconstructs it.
+`L_time` is GETNext-style time **MSE** (not CE); default weight **10**.
+
+`graph_A` is decomposed as `log A_ij ≈ b_j + g(dist_ij) + r_ij`: destination in-degree `b_j` stays in `s_conf`; residual `r_ij` is functional relatedness on factual only.
 
 ---
 
@@ -290,7 +300,8 @@ conda activate getnext-gpu
 - `dataset/NYC/NYC_train.csv`
 - `dataset/NYC/NYC_val.csv`
 - `dataset/NYC/NYC_test.csv`
-- `dataset/NYC/graph_X.csv`（POI 表：坐标 / 类别；因果训练**不用** `graph_A.csv`）
+- `dataset/NYC/graph_X.csv`（POI 表：坐标 / 类别）
+- `dataset/NYC/graph_A.csv`（轨迹流邻接；因果侧拆成 `A_pop` / `A_rel` 查表，不进 GCN）
 
 ### 5. 跑通一次（可选）
 
@@ -303,6 +314,92 @@ bash causal/run_cpu_smoke.sh
 ---
 
 ## Quick start
+
+### 推荐训练（NYC GPU）
+
+和 GETNext 论文同规模的编码器，外加因果拆分的默认损失 / 分数权重。
+**先用这一套**，不要一上来网格搜 `w_*`。选 checkpoint 仍看 **val factual Acc@1 / Acc@20**；每个 epoch 会顺带打 test，只作观察。
+
+比较收敛时看日志里的 `poi`（主 CE），不要看总 `loss`（里面有 `10 ×` 时间 MSE，掉得很快但不代表 Acc）。
+
+```bash
+python causal/train.py \
+  --data-train dataset/NYC/NYC_train.csv \
+  --data-val dataset/NYC/NYC_val.csv \
+  --data-test dataset/NYC/NYC_test.csv \
+  --data-node-feats dataset/NYC/graph_X.csv \
+  --data-adj-mtx dataset/NYC/graph_A.csv \
+  --time-units 48 \
+  --time-feature norm_in_day_time \
+  --poi-embed-dim 128 \
+  --user-embed-dim 128 \
+  --time-embed-dim 32 \
+  --cat-embed-dim 32 \
+  --hc-dim 64 \
+  --transformer-nhid 1024 \
+  --transformer-nlayers 2 \
+  --transformer-nhead 2 \
+  --transformer-dropout 0.3 \
+  --batch 16 \
+  --epochs 200 \
+  --lr 0.001 \
+  --weight_decay 5e-4 \
+  --lambda-pref 0.05 \
+  --lambda-conf 0.05 \
+  --lambda-adv 0.05 \
+  --lambda-recon 0.05 \
+  --lambda-cat 0.05 \
+  --lambda-time 10 \
+  --align-alpha 0.2 \
+  --align-beta 0.3 \
+  --align-gamma 0.3 \
+  --w-pref 1 --w-conf 1 \
+  --w-acc 1 --w-pop 1 --w-tpop 1 --w-area 1 --w-ctx 1 --w-rel 1 \
+  --dist-bins 0.5,1,2,5,10 \
+  --pop-bins 4 \
+  --area-grid-deg 0.02 \
+  --seed 42 \
+  --workers 0 \
+  --device cuda \
+  --name nyc-causal \
+  --exist-ok
+```
+
+指定 GPU：把 `--device cuda` 换成 `--device cuda:0`。显存不够把 `--batch` 改成 `8`。
+
+| 项 | 取值 | 为什么 |
+|----|------|--------|
+| 编码器 | embed 128/128/32/32，Transformer 1024/2/2，dropout 0.3 | 与 GETNext 论文 NYC 同规模；`e_p` 仍是 `nn.Embedding` |
+| `--hc-dim 64` | `h_c` 宽度 | `h_z` 默认等于 `poi-embed-dim`（128），才能做 `<h_z, e_p>` |
+| `--batch 16` `--epochs 200` `--lr 0.001` | 优化 | 与 GETNext 论文命令一致（不要用 parser 默认 batch=20） |
+| `--lambda-time 10` | 时间 **MSE** | 与 GETNext `--time-loss-weight` 对齐；不是 CE |
+| `--lambda-*` 其余 `0.05` | 环带 / 混杂对齐 / 对抗 / 重建 / 类别 | 主 CE 权重永远是 1；辅助项保持弱，避免冲掉 `L_main` |
+| `--align-alpha/beta/gamma` 0.2 / 0.3 / 0.3 | `g̃` | 近、签到热、**转移热**推进 `s_conf`；`A_rel` 不进 `g̃` |
+| 全部 `--w-* 1` | 分数音量 | 训练保持 1；`g_*` 自己会学尺度。只需事后扫 `--w-conf` |
+| `--data-adj-mtx graph_A.csv` | 拆成 `A_pop` + `A_rel` | 热度进 `s_conf`，残差相关只加在 factual |
+
+训练后再扫混杂音量（不必重训）：
+
+```bash
+python causal/predict.py \
+  --checkpoint runs/causal/nyc-causal/checkpoints/best_epoch.state.pt \
+  --data-test dataset/NYC/NYC_test.csv \
+  --w-conf 0.5
+```
+
+`--w-conf` 建议只试 `{0.5, 1, 2}`：factual 太偏近/热就降；factual 几乎等于 deconf 就升。
+
+| 现象 | 先怎么动 |
+|------|----------|
+| `poi` 掉很快，val Acc@1 不动 | 先验捷径。预测时 `--w-conf 0.5`，不要加模型 |
+| factual 涨、deconf 几乎不动 | 混杂在干活、`h_z` 偏弱。可把 `--lambda-pref` / `--lambda-adv` 升到 `0.1` 再训一档 |
+| 两套 Acc 都涨 | 拆分在起作用，保持这套 |
+| 总 `loss` 很低但 `poi` 仍高 | 多半是时间 MSE；忽略总 loss |
+| OOM | `--batch 8`；再不行 `--transformer-nhid 512` |
+
+不要开 `--conf-aux-ce`（会让 `s_conf` 再抢主 CE）。不要六个 `w_*` 一起网格搜。
+
+TKY / Gowalla：超参不变，只改 `--data-*` 四条路径。
 
 ### CPU smoke (few batches, small model)
 
@@ -326,22 +423,7 @@ python causal/train.py \
   --hc-dim 32 --transformer-nhid 256 --transformer-nlayers 2 --transformer-nhead 2
 ```
 
-### GPU (paper-scale-ish)
-
-```bash
-python causal/train.py \
-  --device cuda --batch 16 --epochs 200 --name nyc-causal-gpu --exist-ok \
-  --poi-embed-dim 128 --user-embed-dim 128 --time-embed-dim 32 --cat-embed-dim 32 \
-  --hc-dim 64 --transformer-nhid 1024 --transformer-nlayers 2 --transformer-nhead 2
-```
-
-Force a specific GPU:
-
-```bash
-python causal/train.py --device cuda:0 --batch 16 --epochs 200 --name nyc-cuda0 --exist-ok
-```
-
-`graph_A.csv` is **not** an input. Only the POI table `graph_X.csv` is used (coords / category / fallback counts). Popularity `C_pop` is counted from **train** check-ins.
+CPU 迷你跑仍会读默认的 `graph_A.csv`（拆成查表先验，不是 GCN）。正式结果请用上面的 GPU 推荐命令。
 
 ---
 
@@ -361,10 +443,10 @@ GPU: drop `--no-cuda`.
 
 | Mode | Score | Question |
 |------|--------|----------|
-| `factual` | `w_pref s_pref + w_conf s_conf` with real `C(p)` | next hop under real constraints |
+| `factual` | `w_pref s_pref + w_conf s_conf + w_rel s_rel` with real `C(p)` | next hop under real constraints |
 | `deconf_pref` | `s_pref` only | preferred `do(C)` interest ranking |
-| `deconf_do` | `s_pref + s_conf(φ̄)` | access/pop replaced by training-mode buckets |
-| `deconf_sum` | mix `g_acc` / `g_pop` over `P̂(c)` | cheap back-door marginalisation |
+| `deconf_do` | `s_pref + s_conf(φ̄)` | access/pop/**tpop** replaced by constants; no `s_rel` |
+| `deconf_sum` | drop `g_acc` / `g_pop` / `g_tpop` | cheap back-door; no `s_rel` |
 
 Outputs (when `--output-dir` is omitted, written next to the run):
 
@@ -384,7 +466,11 @@ Do not pick checkpoints with deconfounded Acc (spec §7). Training monitors **fa
 | `--lambda-adv` | GRL adversarial CE on `h_z` | `0.05` |
 | `--lambda-recon` | `h_c` reconstructs `C` | `0.05` |
 | `--lambda-cat` | category aux from `h_z` | `0.05` |
-| `--lambda-time` | GETNext-style time MSE (off by default) | `0.0` |
+| `--lambda-time` | GETNext-style time **MSE** (same scale as `--time-loss-weight`) | `10` |
+| `--data-adj-mtx` | trajectory-flow `graph_A.csv` (split into `A_pop` / `A_rel`) | `dataset/NYC/graph_A.csv` |
+| `--w-tpop` | `s_conf` transition-popularity head | `1.0` |
+| `--w-rel` | factual residual-relatedness head | `1.0` |
+| `--align-gamma` | `g̃` weight on `log_tpop` | `0.3` |
 | `--dist-bins` | km edges for `c_acc` | `0.5,1,2,5,10` |
 | `--pop-bins` | pop quantiles | `4` |
 | `--area-grid-deg` | lat/lon grid | `0.02` |

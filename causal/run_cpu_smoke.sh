@@ -36,6 +36,7 @@ python causal/train.py \
   --data-val dataset/NYC/NYC_val.csv \
   --data-test dataset/NYC/NYC_test.csv \
   --data-node-feats dataset/NYC/graph_X.csv \
+  --data-adj-mtx dataset/NYC/graph_A.csv \
   --time-units 48 \
   --time-feature norm_in_day_time \
   --poi-embed-dim 64 \
@@ -69,6 +70,7 @@ python causal/predict.py \
   --data-test dataset/NYC/NYC_test.csv \
   --data-train dataset/NYC/NYC_train.csv \
   --data-node-feats dataset/NYC/graph_X.csv \
+  --data-adj-mtx dataset/NYC/graph_A.csv \
   --batch "${BATCH}" \
   --no-cuda \
   --max-batches "${MAX_VAL_BATCHES}" \
