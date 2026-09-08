@@ -175,6 +175,10 @@ def parameter_parser():
                         action='store_true',
                         default=False,
                         help='Print detailed per-batch sample dumps (noisy).')
+    parser.add_argument('--no-node-attn',
+                        action='store_true',
+                        default=False,
+                        help='Ablation: do not add NodeAttnMap to POI logits')
     parser.add_argument('--mode',
                         type=str,
                         default='client',

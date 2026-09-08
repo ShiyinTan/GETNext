@@ -243,6 +243,13 @@ class CausalNextPOI(nn.Module):
         # 分数怎么加：附录 D 是直接相加。这里加可调权重，默认全是 1，行为不变。
         # g_acc / g_pop / g_area 自己已有可学的尺度，所以内部四项默认不要网格搜索。
         self.apply_score_weights(args)
+        self.pref_decoder = getattr(args, 'pref_decoder', 'tied')
+        self.rel_source = getattr(args, 'rel_source', 'residual')
+        if self.pref_decoder in ('linear_h', 'linear_hz'):
+            in_dim = d_model if self.pref_decoder == 'linear_h' else self.hz_dim
+            self.decoder_poi = nn.Linear(in_dim, num_pois)
+            self.decoder_poi.bias.data.zero_()
+            self.decoder_poi.weight.data.uniform_(-0.1, 0.1)
 
     def apply_score_weights(self, args):
         """从 args 读分数权重。缺省（旧 checkpoint）一律当 1。
@@ -322,16 +329,25 @@ class CausalNextPOI(nn.Module):
         h_c = self.split_c(h)
         return h, h_z, h_c
 
-    def _s_pref(self, h_z):
-        """兴趣通道：s_pref(p) = h_z 和地点向量 e_p 的点积。
+    def _s_pref(self, h_z, h=None):
+        """兴趣通道。
+
+        tied（默认）: s_pref(p) = <h_z, e_p>
+        linear_hz: Linear(h_z) → N，解开 tied embedding
+        linear_h: Linear(h) → N，和 GETNext decoder_poi 一样用满 Transformer 状态
 
         输入:
             h_z: (B, T, d_z)
+            h:   (B, T, d)，仅 linear_h 需要
         输出:
             s_pref: (B, T, N)
-        中间:
-            e_p: (N, d_z)  和输入嵌入绑在一起
         """
+        if self.pref_decoder == 'linear_h':
+            if h is None:
+                raise ValueError('pref-decoder=linear_h requires transformer state h')
+            return self.decoder_poi(h)
+        if self.pref_decoder == 'linear_hz':
+            return self.decoder_poi(h_z)
         e_p = self.poi_embedding.weight  # (N, d_z)，和输入嵌入绑在一起
         return torch.matmul(h_z, e_p.transpose(0, 1))
 
@@ -424,10 +440,14 @@ class CausalNextPOI(nn.Module):
         输出:
             s_rel: (B, T, N)；没有 a_rel 时返回 None
         """
-        if 'a_rel' not in buffers:
+        if self.rel_source == 'raw':
+            key = 'a_raw'
+        else:
+            key = 'a_rel'
+        if key not in buffers:
             return None
         valid = (origin_idx >= 0)
-        raw = buffers['a_rel'][origin_idx.clamp(min=0)]  # (B, T, N)
+        raw = buffers[key][origin_idx.clamp(min=0)]  # (B, T, N)
         s_rel = self.g_rel(raw.unsqueeze(-1)).squeeze(-1)
         return s_rel * valid.to(dtype=s_rel.dtype).unsqueeze(-1)
 
@@ -441,8 +461,26 @@ class CausalNextPOI(nn.Module):
             s = s + self.w_rel * s_rel
         return s
 
+    def score_parts(self, h_z, h_c, origin_idx, buffers, h=None):
+        """拆出各通道分数，给 diagnose / 消融看谁在打分。
+
+        输入 / 输出形状与 score() 相同；parts 里各项 (B, T, N)。
+        """
+        s_pref = self._s_pref(h_z, h=h)
+        dist_bin, dist_km, origin_area = self._gather_origin_tables(origin_idx, buffers)
+        s_conf, parts = self._s_conf_from_phi(h_c, dist_bin, origin_area, buffers)
+        s_rel = self._s_rel(origin_idx, buffers)
+        if s_rel is None:
+            s_rel = torch.zeros_like(s_pref)
+        out = dict(parts)
+        out['s_pref'] = s_pref
+        out['s_conf'] = s_conf
+        out['s_rel'] = s_rel
+        out['dist_km'] = dist_km
+        return out
+
     def score(self, h_z, h_c, origin_idx, buffers, mode='factual',
-              bar_acc_bin=None, bar_pop_log=None):
+              bar_acc_bin=None, bar_pop_log=None, h=None):
         """按推理模式给出总分 / 兴趣分 / 混杂分（附录 D.5）。
 
         输入:
@@ -464,7 +502,7 @@ class CausalNextPOI(nn.Module):
           deconf_do   距离桶 / 签到热度 / 转移热度都换成同一个干预值；不加 s_rel
           deconf_sum  丢掉随候选变化的距离/热度/转移热度头；不加 s_rel
         """
-        s_pref = self._s_pref(h_z)
+        s_pref = self._s_pref(h_z, h=h)
         dist_bin, dist_km, origin_area = self._gather_origin_tables(origin_idx, buffers)
 
         if mode == 'deconf_pref':

@@ -50,6 +50,8 @@ def parse_args():
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--no-cuda", action="store_true", default=False)
+    parser.add_argument("--no-node-attn", action="store_true", default=False,
+                        help="Ablation: do not add NodeAttnMap to POI logits")
     return parser.parse_args()
 
 
@@ -247,9 +249,12 @@ def main():
             x = batch_padded.to(device=device, dtype=torch.float)
             y_poi = label_padded_poi.to(device=device, dtype=torch.long)
             y_pred_poi, _, _ = seq_model(x, src_mask)
-            y_pred_poi_adjusted = adjust_pred_prob_by_graph(
-                y_pred_poi, batch_input_seqs, batch_seq_lens
-            )
+            if cli.no_node_attn or getattr(args, "no_node_attn", False):
+                y_pred_poi_adjusted = y_pred_poi
+            else:
+                y_pred_poi_adjusted = adjust_pred_prob_by_graph(
+                    y_pred_poi, batch_input_seqs, batch_seq_lens
+                )
             loss_poi = criterion_poi(y_pred_poi_adjusted.transpose(1, 2), y_poi)
             metrics["poi_loss"].append(float(loss_poi.detach().cpu()))
 

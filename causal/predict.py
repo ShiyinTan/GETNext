@@ -131,6 +131,12 @@ def rebuild_table(cli, args, poi_id2idx, meta):
         if 'log_tpop' in meta and 'a_rel' in meta:
             table.log_tpop = meta['log_tpop']
             table.a_rel = meta['a_rel']
+            if 'a_raw' in meta:
+                table.a_raw = meta['a_raw']
+            else:
+                fill_graph_transition_tables(
+                    table, getattr(cli, 'data_adj_mtx', None),
+                    cli.data_node_feats, poi_id2idx)
         else:
             fill_graph_transition_tables(
                 table, getattr(cli, 'data_adj_mtx', None),
@@ -225,7 +231,7 @@ def main():
             scores_by_mode = {}
             for mode in modes:
                 s, s_pref, s_conf, dist_km = model.score(
-                    h_z, h_c, poi, buffers, mode=mode, bar_acc_bin=bar_acc)
+                    h_z, h_c, poi, buffers, mode=mode, bar_acc_bin=bar_acc, h=h)
                 scores_by_mode[mode] = s.cpu().numpy()
                 if mode == 'factual':
                     poi_losses.append(float(criterion_poi(s.transpose(1, 2), batch['y_poi']).detach().cpu()))
