@@ -131,6 +131,14 @@ def parameter_parser():
                         help='s_conf 里 <W_c h_c, ψ(p)> 情境项权重。设 0 = 消融情境头')
     parser.add_argument('--w-rel', type=float, default=1.0,
                         help='factual 里残差相关 s_rel 权重。设 0 = 不要 A_rel；deconf 本来就不加')
+    parser.add_argument('--pref-decoder', type=str, default='tied',
+                        choices=['tied', 'linear_hz', 'linear_h'],
+                        help='兴趣通道怎么打分：tied=<h_z,e_p>；linear_hz=Linear(h_z)；'
+                             'linear_h=Linear(h) 与 GETNext decoder_poi 同容量')
+    parser.add_argument('--rel-source', type=str, default='residual',
+                        choices=['residual', 'raw'],
+                        help='s_rel 用 A 的残差 PMI（默认）还是 log1p(原始 graph_A)。'
+                             'raw 用来检查「拆 A 是否把转移信号拆没了」')
 
     # ---- 训练超参（含义和 GETNext 相同）----
     parser.add_argument('--batch', type=int, default=20, help='一个 batch 几条轨迹')

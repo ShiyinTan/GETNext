@@ -466,7 +466,10 @@ def train(args):
                 y_time = label_padded_time.to(device=args.device, dtype=torch.float)
                 y_cat = label_padded_cat.to(device=args.device, dtype=torch.long)
                 y_pred_poi, y_pred_time, y_pred_cat = seq_model(x, src_mask)
-                y_pred_poi_adjusted = adjust_pred_prob_by_graph(y_pred_poi, batch_input_seqs)
+                if getattr(args, 'no_node_attn', False):
+                    y_pred_poi_adjusted = y_pred_poi
+                else:
+                    y_pred_poi_adjusted = adjust_pred_prob_by_graph(y_pred_poi, batch_input_seqs)
     
                 loss_poi = criterion_poi(y_pred_poi_adjusted.transpose(1, 2), y_poi)
                 loss_time = criterion_time(torch.squeeze(y_pred_time), y_time)
@@ -650,7 +653,10 @@ def train(args):
             # y_pred_poi: (B, T_max, N_poi), y_pred_time: (B, T_max, 1), y_pred_cat: (B, T_max, num_cats)
 
             # 步骤11: 轨迹流图注意力校正 POI logits → (B, T_max, N_poi)
-            y_pred_poi_adjusted = adjust_pred_prob_by_graph(y_pred_poi, batch_input_seqs)
+            if getattr(args, 'no_node_attn', False):
+                y_pred_poi_adjusted = y_pred_poi
+            else:
+                y_pred_poi_adjusted = adjust_pred_prob_by_graph(y_pred_poi, batch_input_seqs)
 
             # 步骤12: 多任务损失
             # CE 需要 (B, C, T)，故对 poi/cat 做 transpose(1,2)

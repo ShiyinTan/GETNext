@@ -116,7 +116,7 @@ class PoiConfounderTable:
 
     字段形状:
         lat / lon / pop / log_pop / area_id / pop_bin: (N,)
-        log_tpop: (N,)  转移入度热度；a_rel: (N, N) 残差相关
+        log_tpop: (N,)  转移入度热度；a_rel: (N, N) 残差相关；a_raw: (N, N) log1p(A)
         dist_km / dist_bin: (N, N)
         dist_edges: (n_edges,)  pop_edges: (≤ P-1,)
         acc_prior: (K,)  pop_prior: (P,)  填完 fill_transition_priors 之后才有
@@ -149,6 +149,8 @@ class PoiConfounderTable:
     # graph_A 拆开：转移热度进 s_conf；残差相关只进 factual s_rel
     log_tpop: np.ndarray = field(default=None)
     a_rel: np.ndarray = field(default=None)
+    # log1p(原始 A)：消融 --rel-source raw 时给 s_rel，避免残差 PMI 把转移信号拆没
+    a_raw: np.ndarray = field(default=None)
 
     def hour_bin(self, norm_in_day_time):
         """GETNext 的时间特征在 [0,1]（一天里的比例）→ 时刻桶 0..47（默认半小时一档）。
@@ -173,6 +175,7 @@ class PoiConfounderTable:
             log_pop:   (N,)   float32
             log_tpop:  (N,)   float32  转移入度热度
             a_rel:     (N, N) float32  残差相关（factual 专用）
+            a_raw:     (N, N) float32  log1p(原始转移 A)
             pop_bin:   (N,)   long
             area_id:   (N,)   long
             acc_prior: (K,)   float32
@@ -181,12 +184,14 @@ class PoiConfounderTable:
         n = int(self.num_pois)
         log_tpop = self.log_tpop if self.log_tpop is not None else np.zeros(n, dtype=np.float32)
         a_rel = self.a_rel if self.a_rel is not None else np.zeros((n, n), dtype=np.float32)
+        a_raw = self.a_raw if self.a_raw is not None else np.zeros((n, n), dtype=np.float32)
         return {
             'dist_bin': torch.from_numpy(self.dist_bin).to(device=device, dtype=torch.long),
             'dist_km': torch.from_numpy(self.dist_km.astype(np.float32)).to(device),
             'log_pop': torch.from_numpy(self.log_pop.astype(np.float32)).to(device),
             'log_tpop': torch.from_numpy(np.asarray(log_tpop, dtype=np.float32)).to(device),
             'a_rel': torch.from_numpy(np.asarray(a_rel, dtype=np.float32)).to(device),
+            'a_raw': torch.from_numpy(np.asarray(a_raw, dtype=np.float32)).to(device),
             'pop_bin': torch.from_numpy(self.pop_bin).to(device=device, dtype=torch.long),
             'area_id': torch.from_numpy(self.area_id).to(device=device, dtype=torch.long),
             'acc_prior': torch.from_numpy(self.acc_prior.astype(np.float32)).to(device),
@@ -285,6 +290,7 @@ def build_poi_table(nodes_df, train_df, args, poi_id2idx):
         n_lon=n_lon,
         log_tpop=np.zeros(num_pois, dtype=np.float32),
         a_rel=np.zeros((num_pois, num_pois), dtype=np.float32),
+        a_raw=np.zeros((num_pois, num_pois), dtype=np.float32),
     )
     return table
 
@@ -394,6 +400,8 @@ def fill_graph_transition_tables(table, adj_path, node_feats_path, poi_id2idx):
         table.log_tpop = np.zeros(n, dtype=np.float32)
     if table.a_rel is None:
         table.a_rel = np.zeros((n, n), dtype=np.float32)
+    if table.a_raw is None:
+        table.a_raw = np.zeros((n, n), dtype=np.float32)
 
     if not adj_path or not os.path.isfile(adj_path):
         return {'loaded': False, 'n_mapped': 0, 'reason': 'missing_adj'}
@@ -431,9 +439,10 @@ def fill_graph_transition_tables(table, adj_path, node_feats_path, poi_id2idx):
             c_idx = np.asarray(mapped_c, dtype=np.int64)
             A_full[np.ix_(c_idx, c_idx)] = A_raw[np.ix_(g_idx, g_idx)]
 
-    log_tpop, a_rel = decompose_graph_adj(A_full, table.dist_km)
+        log_tpop, a_rel = decompose_graph_adj(A_full, table.dist_km)
     table.log_tpop = log_tpop
     table.a_rel = a_rel
+    table.a_raw = np.log1p(A_full).astype(np.float32)
     return {
         'loaded': True,
         'n_mapped': int(n_mapped),
@@ -442,6 +451,7 @@ def fill_graph_transition_tables(table, adj_path, node_feats_path, poi_id2idx):
         'nnz': int((A_full > 0).sum()),
         'tpop_max': float(log_tpop.max()),
         'a_rel_std': float(a_rel.std()),
+        'a_raw_max': float(table.a_raw.max()),
     }
 
 

@@ -355,7 +355,7 @@ def compute_losses(model, batch, buffers, args, ce):
     """
     poi = batch['poi']
     h, h_z, h_c = model.encode(poi, batch['time'], batch['cat'], batch['user'], batch['pad'])
-    s, s_pref, s_conf, _ = model.score(h_z, h_c, poi, buffers, mode='factual')
+    s, s_pref, s_conf, _ = model.score(h_z, h_c, poi, buffers, mode='factual', h=h)
     y = batch['y_poi']
 
     # D.4.1 主损失：总分 s 做全词表 CE，拟合 P(Y|H,C)
@@ -477,6 +477,8 @@ def train(args):
     logging.info(f' score w  : pref={args.w_pref} conf={args.w_conf} '
                  f'acc={args.w_acc} pop={args.w_pop} tpop={args.w_tpop} '
                  f'area={args.w_area} ctx={args.w_ctx} rel={args.w_rel}')
+    logging.info(f' decoder  : pref={getattr(args, "pref_decoder", "tied")} '
+                 f'rel_source={getattr(args, "rel_source", "residual")}')
     logging.info(f' train    : {args.data_train}')
     logging.info(f' val      : {args.data_val}')
     logging.info(f' graph_A  : {args.data_adj_mtx}')
@@ -604,6 +606,7 @@ def train(args):
             'num_pop_bins': table.num_pop_bins,
             'log_tpop': table.log_tpop,
             'a_rel': table.a_rel,
+            'a_raw': table.a_raw,
         }, f)
 
     # ---------- 4. epoch 循环 ----------
